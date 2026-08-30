@@ -1,0 +1,30 @@
+# Zig build outputs & cache
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Executable binaries
+ask
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Secrets & environment
+.env
+.env.*
+!.env.example
+credentials
+*.key
+*.pem
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+*.bak
