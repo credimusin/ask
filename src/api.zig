@@ -4,6 +4,26 @@ const Io = std.Io;
 const File = std.Io.File;
 const http = std.http;
 
+var original_netLookup: *const fn(
+    ?*anyopaque,
+    Io.net.HostName,
+    *Io.Queue(Io.net.HostName.LookupResult),
+    Io.net.HostName.LookupOptions
+) Io.net.HostName.LookupError!void = undefined;
+var custom_vtable: Io.VTable = undefined;
+var vtable_initialized: bool = false;
+
+fn forceIp4NetLookup(
+    userdata: ?*anyopaque,
+    host_name: Io.net.HostName,
+    resolved: *Io.Queue(Io.net.HostName.LookupResult),
+    options: Io.net.HostName.LookupOptions,
+) Io.net.HostName.LookupError!void {
+    var new_options = options;
+    new_options.family = .ip4;
+    return original_netLookup(userdata, host_name, resolved, new_options);
+}
+
 pub const ApiResponse = struct {
     text: []const u8,
     model: []const u8,
@@ -228,7 +248,18 @@ pub fn generateContentStream(
 ) !ApiResponse {
     if (error_detail_out) |out| out.* = null;
 
-    var client = http.Client{ .allocator = allocator, .io = io };
+    if (!vtable_initialized) {
+        original_netLookup = io.vtable.netLookup;
+        custom_vtable = io.vtable.*;
+        custom_vtable.netLookup = forceIp4NetLookup;
+        vtable_initialized = true;
+    }
+    const custom_io = Io{
+        .userdata = io.userdata,
+        .vtable = &custom_vtable,
+    };
+
+    var client = http.Client{ .allocator = allocator, .io = custom_io };
     defer client.deinit();
 
     const url_str = try std.fmt.allocPrint(
