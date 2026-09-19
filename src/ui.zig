@@ -672,7 +672,7 @@ pub fn renderMarkdown(io: Io, stdout: File, allocator: Allocator, text: []const 
             } else {
                 in_code_block = false;
                 last_was_empty = false;
-                const dashes_count = if (box_w > 4) box_w - 4 else 10;
+                const dashes_count = if (box_w > 3) box_w - 3 else 10;
                 const dashes = writeDashes(allocator, dashes_count) catch continue;
                 defer allocator.free(dashes);
 
