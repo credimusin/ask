@@ -24,6 +24,73 @@ fn forceIp4NetLookup(
     return original_netLookup(userdata, host_name, resolved, new_options);
 }
 
+// Manual IPv4 connection using getaddrinfo (bypasses IO vtable for DNS)
+// This ensures we only connect via IPv4 even if the IO vtable has issues
+fn connectIpv4(
+    io: Io,
+    client: *http.Client,
+    host_str: []const u8,
+    port: u16,
+) !*http.Client.Connection {
+    var host_z_buf: [256:0]u8 = undefined;
+    if (host_str.len >= host_z_buf.len) return error.NetworkError;
+    @memcpy(host_z_buf[0..host_str.len], host_str);
+    host_z_buf[host_str.len] = 0;
+
+    var port_buf: [16:0]u8 = undefined;
+    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.NetworkError;
+
+    const hints: std.posix.addrinfo = .{
+        .flags = .{ .NUMERICSERV = true },
+        .family = std.posix.AF.INET,
+        .socktype = std.posix.SOCK.STREAM,
+        .protocol = std.posix.IPPROTO.TCP,
+        .canonname = null,
+        .addr = null,
+        .addrlen = 0,
+        .next = null,
+    };
+
+    var res: ?*std.posix.addrinfo = null;
+    const rc = std.posix.system.getaddrinfo(host_z_buf[0..host_str.len :0].ptr, port_z.ptr, &hints, &res);
+    if (rc != @as(std.posix.system.EAI, @enumFromInt(0)) or res == null) {
+        return error.NetworkError;
+    }
+    defer std.posix.system.freeaddrinfo(res.?);
+
+    const sockaddr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(res.?.addr.?));
+    const ip = std.mem.readInt(u32, std.mem.asBytes(&sockaddr_in.addr), .big);
+    var ip_buf: [32]u8 = undefined;
+    const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+        (ip >> 24) & 0xff,
+        (ip >> 16) & 0xff,
+        (ip >> 8) & 0xff,
+        ip & 0xff,
+    }) catch return error.NetworkError;
+
+    if (client.now == null) {
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, now) catch return error.NetworkError;
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+
+    const host_ip = Io.net.HostName.init(ip_str) catch return error.NetworkError;
+    const host_domain = Io.net.HostName.init(host_str) catch return error.NetworkError;
+
+    return client.connectTcpOptions(.{
+        .host = host_ip,
+        .port = port,
+        .protocol = .tls,
+        .proxied_host = host_domain,
+        .proxied_port = port,
+    }) catch return error.NetworkError;
+}
+
 pub const ApiResponse = struct {
     text: []const u8,
     model: []const u8,
@@ -295,7 +362,11 @@ pub fn generateContentStream(
         .{ .name = "Content-Type", .value = "application/json" },
     };
 
+    // Use manual IPv4 connection to bypass potential IPv6 issues
+    const maybe_conn = connectIpv4(custom_io, &client, uri.host.?.percent_encoded, uri.port orelse 443) catch null;
+
     var req = client.request(.POST, uri, .{
+        .connection = maybe_conn,
         .extra_headers = &extra_headers,
     }) catch {
         if (error_detail_out) |out| {
