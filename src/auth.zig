@@ -38,7 +38,16 @@ pub fn getApiKey(
     const cred_path = getCredentialsPath(allocator, environ) catch return null;
     defer allocator.free(cred_path);
 
-    const file = Dir.openFileAbsolute(io, cred_path, .{}) catch return null;
+    const file = Dir.openFileAbsolute(io, cred_path, .{}) catch |err| {
+        if (err != error.FileNotFound) {
+            const stderr = File.stderr();
+            if (std.fmt.allocPrint(allocator, "Warning: Could not read credentials file: {s}\n", .{@errorName(err)})) |warn| {
+                _ = stderr.writeStreamingAll(io, warn) catch {};
+                allocator.free(warn);
+            } else |_| {}
+        }
+        return null;
+    };
     defer file.close(io);
 
     var list: std.ArrayList(u8) = .empty;
@@ -52,7 +61,12 @@ pub fn getApiKey(
         list.appendSlice(allocator, buf[0..amt]) catch break;
     }
 
-    if (list.items.len == 0) return null;
+    if (list.items.len == 0) {
+        const stderr = File.stderr();
+        const warn = "Warning: Credentials file is empty\n";
+        _ = stderr.writeStreamingAll(io, warn) catch {};
+        return null;
+    }
 
     var lines = std.mem.splitScalar(u8, list.items, '\n');
     if (lines.next()) |first_line| {
