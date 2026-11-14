@@ -49,9 +49,11 @@ pub fn main(init: std.process.Init) !void {
 
     var model_override: ?[]const u8 = null;
     var lang_override: ?[]const u8 = null;
+    var local_url_override: ?[]const u8 = null;
     var save_key_val: ?[]const u8 = null;
     var do_clear = false;
     var raw_mode = false;
+    var local_mode: bool = cfg.local;
     var stream_mode: bool = cfg.stream;
     var fallback_mode: bool = cfg.fallback;
     var show_help = false;
@@ -95,6 +97,25 @@ pub fn main(init: std.process.Init) !void {
             fallback_mode = false;
         } else if (std.mem.eql(u8, arg, "--fallback")) {
             fallback_mode = true;
+        } else if (std.mem.eql(u8, arg, "-L") or std.mem.eql(u8, arg, "--local")) {
+            local_mode = true;
+        } else if (std.mem.eql(u8, arg, "--no-local") or std.mem.eql(u8, arg, "--cloud")) {
+            local_mode = false;
+        } else if (std.mem.eql(u8, arg, "--local-url")) {
+            if (args_it.next()) |u| {
+                if (u.len > 0) local_url_override = u;
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "\n{s}Error:{s} Option '{s}' requires a URL argument.\n\n",
+                    .{ ui_mod.Colors.error_color ++ ui_mod.Colors.bold, ui_mod.Colors.reset, arg },
+                );
+                try stdout.writeStreamingAll(io, err_msg);
+                return;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--local-url=")) {
+            const val = arg["--local-url=".len..];
+            if (val.len > 0) local_url_override = val;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--lang")) {
             if (args_it.next()) |l| {
                 if (l.len > 0) lang_override = l;
@@ -210,7 +231,10 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             \\Config path:     {s}
             \\Credentials:     {s} (status: {s})
-            \\Model:           {s}
+            \\Default Mode:    {s} (active: {s})
+            \\Cloud Model:     {s}
+            \\Local Model:     {s}
+            \\Local URL:       {s}
             \\Fallback:        {s} (pool: gemini-3.5-flash, gemini-3.5-flash-lite, gemini-2.5-flash, gemini-2.5-flash-lite, gemma-4-31b-it)
             \\Streaming:       {s} (default in config: {s})
             \\Temp:            {d:.2}
@@ -222,7 +246,11 @@ pub fn main(init: std.process.Init) !void {
                 cfg_path,
                 cred_path,
                 if (has_key) "configured" else "missing",
+                if (cfg.local) "local" else "cloud (Gemini)",
+                if (local_mode) "local" else "cloud (Gemini)",
                 cfg.model,
+                cfg.local_model,
+                local_url_override orelse cfg.local_url,
                 if (fallback_mode) "enabled" else "disabled",
                 if (stream_mode) "enabled" else "disabled",
                 if (cfg.stream) "enabled" else "disabled",
@@ -236,7 +264,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const model_to_use = model_override orelse cfg.model;
+    const local_url_to_use = local_url_override orelse cfg.local_url;
+    const model_to_use = model_override orelse (if (local_mode) cfg.local_model else cfg.model);
 
     // Check if stdin has piped data (not a TTY)
     const is_stdin_tty = stdin.isTty(io) catch true;
@@ -294,16 +323,33 @@ pub fn main(init: std.process.Init) !void {
         final_prompt = piped;
     }
 
-    // Check for API Key
+    // Check for API Key (only required in cloud mode)
     const api_key = auth_mod.getApiKey(allocator, io, init.environ_map);
-    if (api_key == null) {
+    if (!local_mode and api_key == null) {
         ui_mod.printMissingKeyHelp(io, stdout, allocator);
         return;
     }
 
     // If no arguments (or --tui) and stdin is a TTY, run interactive TUI
     if ((final_prompt == null or force_tui) and is_stdin_tty) {
-        try runInteractive(init.gpa, io, stdout, stdin, init.environ_map, api_key.?, model_to_use, cfg.system_instruction, cfg.temperature, cfg.thinking_budget, stream_mode, fallback_mode);
+        try runInteractive(
+            init.gpa,
+            io,
+            stdout,
+            stdin,
+            init.environ_map,
+            api_key,
+            local_mode,
+            local_url_to_use,
+            cfg.model,
+            cfg.local_model,
+            model_to_use,
+            cfg.system_instruction,
+            cfg.temperature,
+            cfg.thinking_budget,
+            stream_mode,
+            fallback_mode,
+        );
         return;
     }
 
@@ -337,29 +383,46 @@ pub fn main(init: std.process.Init) !void {
     };
     var err_detail: ?api_mod.ApiErrorDetail = null;
 
-    const response = api_mod.generateWithFallback(
-        allocator,
-        io,
-        api_key.?,
-        model_to_use,
-        fallback_mode,
-        final_prompt.?,
-        effective_system_instruction,
-        cfg.temperature,
-        cfg.thinking_budget,
-        if (use_live_stream) handleStart else null,
-        if (use_live_stream) handleChunk else null,
-        if (use_live_stream) @ptrCast(&stream_ctx) else null,
-        &err_detail,
-    ) catch |err| {
+    const maybe_resp = if (local_mode)
+        api_mod.generateLocalStream(
+            allocator,
+            io,
+            local_url_to_use,
+            model_to_use,
+            final_prompt.?,
+            effective_system_instruction,
+            cfg.temperature,
+            if (use_live_stream) handleStart else null,
+            if (use_live_stream) handleChunk else null,
+            if (use_live_stream) @ptrCast(&stream_ctx) else null,
+            &err_detail,
+        )
+    else
+        api_mod.generateWithFallback(
+            allocator,
+            io,
+            api_key.?,
+            model_to_use,
+            fallback_mode,
+            final_prompt.?,
+            effective_system_instruction,
+            cfg.temperature,
+            cfg.thinking_budget,
+            if (use_live_stream) handleStart else null,
+            if (use_live_stream) handleChunk else null,
+            if (use_live_stream) @ptrCast(&stream_ctx) else null,
+            &err_detail,
+        );
+
+    const response = maybe_resp catch |err| {
         if (spinner) |*sp| sp.stop(allocator);
         if (should_style) {
             if (err_detail) |ed| {
                 ui_mod.printErrorBox(io, stdout, allocator, ed.title, ed.message, ed.suggestion);
             } else {
-                const fallback_msg = try std.fmt.allocPrint(allocator, "Failed to get response from Gemini ({})", .{err});
+                const fallback_msg = try std.fmt.allocPrint(allocator, "Failed to get response ({})", .{err});
                 defer allocator.free(fallback_msg);
-                ui_mod.printErrorBox(io, stdout, allocator, "Gemini Error", fallback_msg, null);
+                ui_mod.printErrorBox(io, stdout, allocator, if (local_mode) "Local LLM Error" else "Gemini Error", fallback_msg, null);
             }
         } else {
             if (err_detail) |ed| {
@@ -372,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
                     try stdout.writeStreamingAll(io, raw_sug);
                 }
             } else {
-                const raw_err = try std.fmt.allocPrint(allocator, "\nError: Failed to get response from Gemini ({})\n\n", .{err});
+                const raw_err = try std.fmt.allocPrint(allocator, "\nError: Failed to get response ({})\n\n", .{err});
                 defer allocator.free(raw_err);
                 try stdout.writeStreamingAll(io, raw_err);
             }
@@ -426,7 +489,11 @@ fn runInteractive(
     stdout: File,
     stdin: File,
     environ_map: *std.process.Environ.Map,
-    api_key: []const u8,
+    api_key: ?[]const u8,
+    initial_local_mode: bool,
+    local_url: []const u8,
+    default_cloud_model: []const u8,
+    default_local_model: []const u8,
     initial_model: []const u8,
     system_instruction: ?[]const u8,
     initial_temperature: f64,
@@ -434,6 +501,7 @@ fn runInteractive(
     initial_stream_mode: bool,
     fallback_mode: bool,
 ) !void {
+    var local_mode: bool = initial_local_mode;
     var active_model: []const u8 = initial_model;
     var owned_model: ?[]u8 = null;
     defer if (owned_model) |m| allocator.free(m);
@@ -504,6 +572,27 @@ fn runInteractive(
                 if (std.mem.eql(u8, line, "/stream")) {
                     stream_mode = !stream_mode;
                     const toast = try std.fmt.allocPrint(allocator, "✦ Streaming mode: {s}", .{if (stream_mode) "enabled" else "disabled"});
+                    defer allocator.free(toast);
+                    ui_mod.printTuiToast(io, stdout, allocator, toast);
+                    continue;
+                }
+
+                if (std.mem.eql(u8, line, "/local")) {
+                    if (local_mode and api_key == null) {
+                        ui_mod.printTuiToast(io, stdout, allocator, "⚠ Cannot switch to Cloud mode: Gemini API key is not configured.");
+                        continue;
+                    }
+                    local_mode = !local_mode;
+                    if (owned_model) |old_m| {
+                        allocator.free(old_m);
+                        owned_model = null;
+                    }
+                    active_model = if (local_mode) default_local_model else default_cloud_model;
+                    const toast = try std.fmt.allocPrint(
+                        allocator,
+                        "✦ Switched to {s} mode (model: {s})",
+                        .{ if (local_mode) "Local LLM" else "Gemini Cloud", active_model },
+                    );
                     defer allocator.free(toast);
                     ui_mod.printTuiToast(io, stdout, allocator, toast);
                     continue;
@@ -613,27 +702,44 @@ fn runInteractive(
                 };
                 var err_detail: ?api_mod.ApiErrorDetail = null;
 
-                const response = api_mod.generateWithFallback(
-                    turn_alloc,
-                    io,
-                    api_key,
-                    active_model,
-                    fallback_mode,
-                    line,
-                    system_instruction,
-                    temperature,
-                    thinking_budget,
-                    if (stream_mode) handleStart else null,
-                    if (stream_mode) handleChunk else null,
-                    if (stream_mode) @ptrCast(&stream_ctx) else null,
-                    &err_detail,
-                ) catch |err| {
+                const maybe_resp = if (local_mode)
+                    api_mod.generateLocalStream(
+                        turn_alloc,
+                        io,
+                        local_url,
+                        active_model,
+                        line,
+                        system_instruction,
+                        temperature,
+                        if (stream_mode) handleStart else null,
+                        if (stream_mode) handleChunk else null,
+                        if (stream_mode) @ptrCast(&stream_ctx) else null,
+                        &err_detail,
+                    )
+                else
+                    api_mod.generateWithFallback(
+                        turn_alloc,
+                        io,
+                        api_key.?,
+                        active_model,
+                        fallback_mode,
+                        line,
+                        system_instruction,
+                        temperature,
+                        thinking_budget,
+                        if (stream_mode) handleStart else null,
+                        if (stream_mode) handleChunk else null,
+                        if (stream_mode) @ptrCast(&stream_ctx) else null,
+                        &err_detail,
+                    );
+
+                const response = maybe_resp catch |err| {
                     if (spinner) |*sp| sp.stop(turn_alloc);
                     if (err_detail) |ed| {
                         ui_mod.printErrorBox(io, stdout, turn_alloc, ed.title, ed.message, ed.suggestion);
                     } else {
-                        const fallback_msg = try std.fmt.allocPrint(turn_alloc, "Failed to get response from Gemini ({})", .{err});
-                        ui_mod.printErrorBox(io, stdout, turn_alloc, "Gemini Error", fallback_msg, null);
+                        const fallback_msg = try std.fmt.allocPrint(turn_alloc, "Failed to get response ({})", .{err});
+                        ui_mod.printErrorBox(io, stdout, turn_alloc, if (local_mode) "Local LLM Error" else "Gemini Error", fallback_msg, null);
                     }
                     continue;
                 };

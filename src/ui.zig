@@ -119,12 +119,17 @@ pub fn visualWidth(str: []const u8) usize {
 }
 
 pub fn formatModelShort(allocator: Allocator, model: []const u8, is_fallback: bool) ![]const u8 {
-    var base: []const u8 = model;
+    var clean_model = std.fs.path.basename(model);
+    if (std.mem.endsWith(u8, clean_model, ".gguf")) {
+        clean_model = clean_model[0 .. clean_model.len - 5];
+    }
+
+    var base: []const u8 = clean_model;
     var allocated_base: ?[]const u8 = null;
     defer if (allocated_base) |b| allocator.free(b);
 
-    if (std.mem.startsWith(u8, model, "gemini-")) {
-        const rest = model["gemini-".len..];
+    if (std.mem.startsWith(u8, clean_model, "gemini-")) {
+        const rest = clean_model["gemini-".len..];
         if (std.mem.indexOfScalar(u8, rest, '-')) |dash_idx| {
             const ver = rest[0..dash_idx];
             const suffix = rest[dash_idx + 1 ..];
@@ -146,8 +151,8 @@ pub fn formatModelShort(allocator: Allocator, model: []const u8, is_fallback: bo
             allocated_base = try std.fmt.allocPrint(allocator, "Gemini-{s}", .{rest});
             base = allocated_base.?;
         }
-    } else if (std.mem.startsWith(u8, model, "gemma-")) {
-        const rest = model["gemma-".len..];
+    } else if (std.mem.startsWith(u8, clean_model, "gemma-")) {
+        const rest = clean_model["gemma-".len..];
         if (std.mem.endsWith(u8, rest, "-it")) {
             const without_it = rest[0 .. rest.len - 3];
             var upper_buf = try allocator.alloc(u8, without_it.len);
@@ -171,6 +176,10 @@ pub fn formatModelShort(allocator: Allocator, model: []const u8, is_fallback: bo
 }
 
 pub fn calculateCostUsd(model: []const u8, prompt_tokens: i64, cand_tokens: i64) f64 {
+    if (!std.mem.startsWith(u8, model, "gemini-")) {
+        return 0.0;
+    }
+
     var p_rate: f64 = 0.075 / 1_000_000.0;
     var c_rate: f64 = 0.30 / 1_000_000.0;
 
@@ -183,9 +192,6 @@ pub fn calculateCostUsd(model: []const u8, prompt_tokens: i64, cand_tokens: i64)
     } else if (std.mem.indexOf(u8, model, "flash") != null) {
         p_rate = 0.10 / 1_000_000.0;
         c_rate = 0.40 / 1_000_000.0;
-    } else if (std.mem.indexOf(u8, model, "gemma") != null) {
-        p_rate = 0.0;
-        c_rate = 0.0;
     }
 
     const p_f: f64 = @floatFromInt(@max(0, prompt_tokens));
@@ -1354,8 +1360,9 @@ pub fn printTuiHelp(io: Io, stdout: File, allocator: Allocator) void {
 
     out.appendSlice(allocator, B ++ "│" ++ R ++ "  " ++ S ++ "SLASH COMMANDS:" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/help" ++ R ++ ", " ++ H ++ "/?" ++ R ++ "         Show this quick help card\n") catch return;
-    out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/model <name>" ++ R ++ "  Switch active Gemini model on the fly\n") catch return;
+    out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/model <name>" ++ R ++ "  Switch active model on the fly\n") catch return;
     out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/models" ++ R ++ "        List recommended available models\n") catch return;
+    out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/local" ++ R ++ "         Toggle between Local LLM and Gemini Cloud API\n") catch return;
     out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/stream" ++ R ++ "        Toggle real-time streaming\n") catch return;
     out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/copy" ++ R ++ ", " ++ H ++ "/y" ++ R ++ "        Copy last response to clipboard\n") catch return;
     out.appendSlice(allocator, B ++ "│" ++ R ++ "    " ++ H ++ "/copy <key>" ++ R ++ "    Copy snippet to clipboard (" ++ W ++ "/copy a" ++ R ++ ")\n") catch return;
@@ -1532,6 +1539,7 @@ pub fn printHelp(io: Io, stdout: File, allocator: Allocator) void {
 
     out.appendSlice(allocator, S ++ "EXAMPLES:" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ W ++ "ask how to find large files over 1GB in linux" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "ask --local explain how TCP 3-way handshake works" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ W ++ "git diff | ask write a concise commit message" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ W ++ "cat log.txt | ask explain why this failed" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ W ++ "ask -m gemini-2.5-pro design a clean database schema" ++ R ++ "\n") catch return;
@@ -1541,7 +1549,10 @@ pub fn printHelp(io: Io, stdout: File, allocator: Allocator) void {
     out.appendSlice(allocator, S ++ "OPTIONS:" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-k, --key <api-key>" ++ R ++ "     Save API key securely for persistent use\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --clear" ++ R ++ "             Remove saved credentials and reset configuration\n") catch return;
-    out.appendSlice(allocator, "  " ++ H ++ "-m, --model <name>" ++ R ++ "     Override model (e.g. gemini-3.5-flash-lite, gemini-3.5-flash)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "-L, --local" ++ R ++ "             Use local LLM server (llama.cpp / OpenAI compatible)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "    --no-local" ++ R ++ "          Use Google Gemini API (default)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "    --local-url <url>" ++ R ++ "   Override local LLM endpoint (default: http://127.0.0.1:8888)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "-m, --model <name>" ++ R ++ "     Override model (cloud Gemini model or local model with --local)\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-l, --lang <lang>" ++ R ++ "      Specify target language/filetype context (e.g. -l=zig, -l=python)\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --fallback" ++ R ++ "         Enable automatic model fallback if model is busy/rate-limited (default)\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --no-fallback" ++ R ++ "      Disable model fallback, fail if requested model fails\n") catch return;
@@ -1590,6 +1601,10 @@ test "formatModelShort tests" {
     const s6 = try formatModelShort(allocator, "gemma-4-31b-it", true);
     defer allocator.free(s6);
     try std.testing.expectEqualStrings("Gemma-4-31B (F)", s6);
+
+    const s7 = try formatModelShort(allocator, "~/Devs/ask/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf", false);
+    defer allocator.free(s7);
+    try std.testing.expectEqualStrings("qwen2.5-coder-3b-instruct-q4_k_m", s7);
 }
 
 test "visualWidth tests" {
@@ -1627,6 +1642,9 @@ test "calculateCostUsd tests" {
 
     const cost_pro = calculateCostUsd("gemini-2.5-pro", 1000, 1000);
     try std.testing.expect(cost_pro > 0.006 and cost_pro < 0.007);
+
+    const cost_local = calculateCostUsd("qwen2.5-coder-3b-instruct", 1000, 1000);
+    try std.testing.expectEqual(@as(f64, 0.0), cost_local);
 }
 
 test "stripMarkdownFences strips outer fences and preserves indentation" {

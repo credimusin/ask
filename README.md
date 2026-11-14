@@ -8,18 +8,12 @@ Designed for developers and terminal power users who want instant answers, expla
 
 ## Features
 
-- **Blazing Fast & Real-time Streaming**: Native Zig binary with live Server-Sent Events (SSE) streaming tokens directly as they are generated.
-- **Autonomous Floating TUI & Popup Mode**: Standalone interactive terminal UI with clean input editor, history cycling, slash commands, and hotkey/Rofi launcher integration.
-- **Intelligent Word Wrapping & Preserved Indentation**: Output text wraps cleanly without stretching across wide monitors, preserving nested list indentation (`•`, `◦`, `1.`), blockquotes (`▎`), and full ANSI color formatting across lines.
-- **Horizontal Scrolling Input Viewport**: Smooth single-line prompt editing with automatic horizontal viewport scrolling for long queries, preventing line duplication or terminal artifacts.
-- **Token & Cost Tracking in USD**: Real-time execution stats in response footers showing elapsed time, token counts, and estimated cost in USD (e.g. `0.28s • 120 tokens • $0.00003`).
-- **Compact Model Indicators & Smart Fallback**: Shortened model tags (`Gemini-3.5FL`, `Gemini-3.5F`, `Gemini-2.5P`, `Gemma-4-31B`) with automatic fallback support (`(F)`) when a primary model is rate-limited or busy.
-- **Interactive Runner & Quick Execute**: Code snippets in output receive shortcut keys (`[ a ]`, `[ b ]`). Press `a` or `1` at the `Run ❯` prompt to load and edit the command, press `Enter` to execute immediately in your shell, press `y` to copy to clipboard, or `q` to quit. Multi-line language scripts (Python, Node, Bash, Ruby, etc.) are safely dispatched to their respective interpreters.
-- **Clean Terminal Selection & Clipboard Copying**: Markdown code blocks use clean indentation with no intrusive vertical border characters (`│`), ensuring mouse drag-selection copies pure code. One-key clipboard copying via universal OSC 52 escape sequences and `wl-copy`/`xclip`.
-- **Catppuccin Macchiato Aesthetic**: Rich 24-bit TrueColor terminal formatting with styled code blocks, language badges, markdown lists, headers, and execution metrics.
-- **Secure Credential Storage**: Store your API key with `ask --key "YOUR_KEY"` into `~/.local/share/ask/credentials` with strict `0600` Unix permissions (`rw-------`). No plaintext API keys in general config files.
-- **Stdin & Pipe Integration**: Pipe terminal output, logs, or git diffs directly into `ask`.
-- **Scriptable & Raw Mode**: Use `-r` / `--raw` for plain unformatted output suitable for pipes (`ask -r "..." | wl-copy`).
+- **Cloud & Local LLM (`-L` / `--local`)**: Uses Google Gemini API (`Gemini 3.5 / 2.5 / Gemma 4`) by default, or connects to any local `llama-server` / OpenAI-compatible endpoint (`--local`) for 100% offline use.
+- **One-Shot CLI & Interactive TUI**: Run quick unquoted queries from the shell (`ask how to...`) or launch a floating TUI session (`ask` / `--tui`) with history and slash commands (`/local`, `/model`, `/copy`, `/run`).
+- **Interactive Snippet Runner**: Code blocks get hotkeys (`[ a ]`, `[ b ]`) — press `a` to edit/run commands directly in your shell or `y` to copy to clipboard (`OSC 52` / `wl-copy`).
+- **Editor & Pipe Ready (`-r`, `-l`)**: Pipe `stdin` (`git diff | ask ...`) or integrate directly with editors like **Helix** using `-r` (strips UI and ` ``` ` fences) and `-l=<lang>`.
+- **Terminal-Native Markdown**: Catppuccin Macchiato TrueColor theme, clean borderless code blocks for easy mouse selection, and execution stats (`time • tokens • $USD`).
+- **Secure Key Storage**: Stores API keys in `~/.local/share/ask/credentials` with strict `0600` permissions.
 
 ---
 
@@ -103,10 +97,14 @@ cat crash.log | ask explain what caused this panic and suggest a fix
 git diff HEAD~1 | ask review this diff for potential bugs or security risks
 ```
 
-### 3. Model Override & Fallback
+### 3. Model Override, Local LLM & Fallback
 ```bash
 # Use Gemini 2.5 Pro for deep reasoning and architecture design
 ask -m gemini-2.5-pro design a clean SQL database schema for an e-commerce order system
+
+# Query local LLM via llama-server (http://127.0.0.1:8888)
+ask --local write a fast quicksort in zig
+ask -L -m qwen2.5-coder-3b-instruct explain this regex
 
 # Disable automatic fallback if you strictly want only the specified model
 ask --no-fallback -m gemini-3.5-flash quick query
@@ -203,7 +201,10 @@ bindsym --to-code $mod+Mod1+i exec ~/.local/bin/ask-popup.sh
 | :--- | :--- |
 | `-k, --key <api-key>` | Save Gemini API key securely to credentials file (`0600`) |
 | `--clear`, `--reset` | Delete stored credentials and reset configuration |
-| `-m, --model <name>` | Override model for query (e.g. `gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-2.5-pro`) |
+| `-L, --local` | Use local LLM server (`llama-server` / OpenAI `/v1/chat/completions`) |
+| `--no-local`, `--cloud` | Force Google Gemini API mode (default) |
+| `--local-url <url>` | Override local LLM server URL (default: `http://127.0.0.1:8888`) |
+| `-m, --model <name>` | Override model for query (cloud Gemini model or local model with `--local`) |
 | `-l, --lang <lang>` | Specify target language / filetype context (e.g. `-l=zig`, `-l=%{language}`) |
 | `--fallback` | Enable automatic model fallback if model is busy/rate-limited (default) |
 | `--no-fallback` | Disable fallback, fail if requested model fails |
@@ -223,6 +224,9 @@ bindsym --to-code $mod+Mod1+i exec ~/.local/bin/ask-popup.sh
   ```json
   {
     "model": "gemini-3.5-flash-lite",
+    "local": false,
+    "local_url": "http://127.0.0.1:8888",
+    "local_model": "~/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
     "system_instruction": "You are a lightning-fast CLI assistant. Provide ultra-concise, direct answers. Give immediate commands or code without preamble, conversational filler, or greetings.",
     "temperature": 0.2,
     "thinking_budget": 0,

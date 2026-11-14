@@ -5,6 +5,9 @@ const Dir = std.Io.Dir;
 
 pub const Config = struct {
     model: []const u8 = "gemini-3.5-flash-lite",
+    local: bool = false,
+    local_url: []const u8 = "http://127.0.0.1:8888",
+    local_model: []const u8 = "~/Devs/ask/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
     system_instruction: []const u8 = "You are a lightning-fast CLI assistant. Provide ultra-concise, direct answers. Give immediate commands or code without preamble, conversational filler, or greetings.",
     temperature: f64 = 0.2,
     thinking_budget: ?i32 = 0,
@@ -85,6 +88,9 @@ pub fn saveDefault(io: Io, path: []const u8) !void {
     const default_json =
         \\{
         \\  "model": "gemini-3.5-flash-lite",
+        \\  "local": false,
+        \\  "local_url": "http://127.0.0.1:8888",
+        \\  "local_model": "~/Devs/ask/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
         \\  "system_instruction": "You are a lightning-fast CLI assistant. Provide ultra-concise, direct answers. Give immediate commands or code without preamble, conversational filler, or greetings.",
         \\  "temperature": 0.2,
         \\  "thinking_budget": 0,
