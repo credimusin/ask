@@ -78,47 +78,50 @@ export GEMINI_API_KEY="AIzaSyYourSecretApiKeyHere"
 ### 2. Ask Away!
 
 ```bash
-ask "how to recursively count lines of code in zig"
+ask how to recursively count lines of code in zig
 ```
 
 ---
 
 ## Practical Use Cases & Examples
 
-### 1. Quick Terminal Lookup
+### 1. Quick Terminal Lookup (No Quotes Needed)
 ```bash
-ask "how to find and delete empty directories in linux"
-ask "explain the difference between tcp and udp in 2 sentences"
+ask how to find and delete empty directories in linux
+ask explain the difference between tcp and udp in 2 sentences
 ```
 
 ### 2. Piped Input & Context Analysis
 ```bash
 # Generate a git commit message from staged changes
-git diff --staged | ask "write a concise conventional commit message"
+git diff --staged | ask write a concise conventional commit message
 
 # Analyze a panic or error log
-cat crash.log | ask "explain what caused this panic and suggest a fix"
+cat crash.log | ask explain what caused this panic and suggest a fix
 
 # Review code before commit
-git diff HEAD~1 | ask "review this diff for potential bugs or security risks"
+git diff HEAD~1 | ask review this diff for potential bugs or security risks
 ```
 
 ### 3. Model Override & Fallback
 ```bash
 # Use Gemini 2.5 Pro for deep reasoning and architecture design
-ask -m gemini-2.5-pro "design a clean SQL database schema for an e-commerce order system"
+ask -m gemini-2.5-pro design a clean SQL database schema for an e-commerce order system
 
 # Disable automatic fallback if you strictly want only the specified model
-ask --no-fallback -m gemini-3.5-flash "quick query"
+ask --no-fallback -m gemini-3.5-flash quick query
 ```
 
-### 4. Raw Output for Shell Scripting & Clipboard
+### 4. Raw Output for Editors, Shell Scripting & Clipboard
 ```bash
-# Copy directly to clipboard
-ask -r "regex for validating IPv4 address" | wl-copy
+# Copy directly to clipboard (strips markdown ``` fences automatically)
+ask -r regex for validating IPv4 address | wl-copy
+
+# Generate pure code for a specific language
+ask -r -l=zig write a binary search function
 
 # Save script output to a file
-ask -r "write a bash script to backup /var/log daily" > backup.sh
+ask -r write a bash script to backup /var/log daily > backup.sh
 ```
 
 ### 5. Autonomous TUI & Interactive Session
@@ -164,7 +167,22 @@ ask ❯ How do I check open ports in Linux?
 
 ---
 
-## Desktop & Window Manager Integration
+## Desktop, Editor & Window Manager Integration
+
+### Helix Editor (`~/.config/helix/config.toml`)
+Integrate `ask` directly into Helix using `-r` (raw output without Markdown ` ``` ` fences) and `-l=%{language}` (automatic buffer language detection):
+
+```toml
+[keys.normal.space]
+q = "@:insert-output ask -r -l=%{language} "
+Q = "@|ask -r -l=%{language} "
+
+[keys.select.space]
+q = "@|ask -r -l=%{language} "
+```
+
+- **Insert code at cursor (<kbd>Space</kbd> + <kbd>q</kbd> in Normal mode):** Opens `:insert-output ask -r -l=%{language} `. Type your prompt without quotes and press <kbd>Enter</kbd> to insert clean code directly at the cursor.
+- **Transform or analyze selected code (<kbd>Space</kbd> + <kbd>q</kbd> in Select mode, or <kbd>Space</kbd> + <kbd>Shift</kbd> + <kbd>Q</kbd> in Normal mode):** Opens `Shell pipe: ask -r -l=%{language} `. Pipes the active selection into `ask` as context along with your prompt and replaces the selection with the result.
 
 ### Sway / Wayland Hotkey Popup
 Add floating window rules and a hotkey to your Sway config (`~/.config/sway/config.d/99-ask-tui.conf`):
@@ -186,12 +204,13 @@ bindsym --to-code $mod+Mod1+i exec ~/.local/bin/ask-popup.sh
 | `-k, --key <api-key>` | Save Gemini API key securely to credentials file (`0600`) |
 | `--clear`, `--reset` | Delete stored credentials and reset configuration |
 | `-m, --model <name>` | Override model for query (e.g. `gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-2.5-pro`) |
+| `-l, --lang <lang>` | Specify target language / filetype context (e.g. `-l=zig`, `-l=%{language}`) |
 | `--fallback` | Enable automatic model fallback if model is busy/rate-limited (default) |
 | `--no-fallback` | Disable fallback, fail if requested model fails |
 | `-s, --stream` | Stream tokens live in real-time |
 | `--no-stream` | Wait for full response and render formatted markdown (default) |
 | `-t, --tui` | Force launch interactive TUI session |
-| `-r, --raw` | Output plain text without ANSI escape codes or boxes |
+| `-r, --raw` | Output clean plain text/code without ANSI styling or markdown ` ``` ` fences |
 | `-c, --config` | Display config paths, credential status, and active settings |
 | `-h, --help` | Display help screen |
 | `-v, --version` | Display version information |

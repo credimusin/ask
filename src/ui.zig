@@ -1476,6 +1476,44 @@ pub fn printSnippetHint(io: Io, stdout: File, allocator: Allocator, count: usize
     stdout.writeStreamingAll(io, msg) catch {};
 }
 
+pub fn stripMarkdownFences(text: []const u8) []const u8 {
+    const trimmed_outer = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed_outer, "```") or !std.mem.endsWith(u8, trimmed_outer, "```")) {
+        return text;
+    }
+
+    const first_nl = std.mem.indexOfScalar(u8, trimmed_outer, '\n') orelse return text;
+    const header = std.mem.trim(u8, trimmed_outer[3..first_nl], " \t\r");
+    if (std.mem.indexOfScalar(u8, header, '`') != null) {
+        return text;
+    }
+
+    const last_nl = std.mem.lastIndexOfScalar(u8, trimmed_outer, '\n') orelse return text;
+    if (last_nl < first_nl) return text;
+
+    const closing_line = std.mem.trim(u8, trimmed_outer[last_nl + 1 ..], " \t\r");
+    if (!std.mem.eql(u8, closing_line, "```")) {
+        return text;
+    }
+
+    if (last_nl == first_nl) return "";
+
+    var body = trimmed_outer[first_nl + 1 .. last_nl];
+    if (std.mem.endsWith(u8, body, "\r")) {
+        body = body[0 .. body.len - 1];
+    }
+
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const tline = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, tline, "```")) {
+            return text;
+        }
+    }
+
+    return body;
+}
+
 pub fn printHelp(io: Io, stdout: File, allocator: Allocator) void {
     const P = Colors.primary ++ Colors.bold;
     const S = Colors.secondary ++ Colors.bold;
@@ -1488,27 +1526,28 @@ pub fn printHelp(io: Io, stdout: File, allocator: Allocator) void {
 
     out.appendSlice(allocator, "\n" ++ P ++ "ask" ++ R ++ " — Fast, lightweight terminal assistant powered by Gemini API\n\n") catch return;
     out.appendSlice(allocator, S ++ "USAGE:" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  ask [OPTIONS] \"<prompt>\"\n") catch return;
-    out.appendSlice(allocator, "  <command> | ask [OPTIONS] \"<prompt>\"\n") catch return;
+    out.appendSlice(allocator, "  ask [OPTIONS] <prompt...>\n") catch return;
+    out.appendSlice(allocator, "  <command> | ask [OPTIONS] <prompt...>\n") catch return;
     out.appendSlice(allocator, "  ask (standalone interactive TUI)\n\n") catch return;
 
     out.appendSlice(allocator, S ++ "EXAMPLES:" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  " ++ W ++ "ask \"how to find large files over 1GB in linux\"" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  " ++ W ++ "git diff | ask \"write a concise commit message\"" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  " ++ W ++ "cat log.txt | ask \"explain why this failed\"" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  " ++ W ++ "ask -m gemini-2.5-pro \"design a clean database schema\"" ++ R ++ "\n") catch return;
-    out.appendSlice(allocator, "  " ++ W ++ "ask --stream \"live streaming response\"" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "ask how to find large files over 1GB in linux" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "git diff | ask write a concise commit message" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "cat log.txt | ask explain why this failed" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "ask -m gemini-2.5-pro design a clean database schema" ++ R ++ "\n") catch return;
+    out.appendSlice(allocator, "  " ++ W ++ "ask -r -l=zig write a binary search function" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ W ++ "ask --key \"AIzaSy...\"" ++ R ++ "\n\n") catch return;
 
     out.appendSlice(allocator, S ++ "OPTIONS:" ++ R ++ "\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-k, --key <api-key>" ++ R ++ "     Save API key securely for persistent use\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --clear" ++ R ++ "             Remove saved credentials and reset configuration\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-m, --model <name>" ++ R ++ "     Override model (e.g. gemini-3.5-flash-lite, gemini-3.5-flash)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "-l, --lang <lang>" ++ R ++ "      Specify target language/filetype context (e.g. -l=zig, -l=python)\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --fallback" ++ R ++ "         Enable automatic model fallback if model is busy/rate-limited (default)\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --no-fallback" ++ R ++ "      Disable model fallback, fail if requested model fails\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-s, --stream" ++ R ++ "           Stream tokens live in real-time\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "    --no-stream" ++ R ++ "        Wait for full response and render markdown (default)\n") catch return;
-    out.appendSlice(allocator, "  " ++ H ++ "-r, --raw" ++ R ++ "              Output raw plain text (no styling or headers)\n") catch return;
+    out.appendSlice(allocator, "  " ++ H ++ "-r, --raw" ++ R ++ "              Output raw code/text without styling or markdown ``` fences\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-c, --config" ++ R ++ "           Show config file path and current configuration\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-h, --help" ++ R ++ "             Show this help message\n") catch return;
     out.appendSlice(allocator, "  " ++ H ++ "-v, --version" ++ R ++ "          Show version information\n\n") catch return;
@@ -1588,5 +1627,16 @@ test "calculateCostUsd tests" {
 
     const cost_pro = calculateCostUsd("gemini-2.5-pro", 1000, 1000);
     try std.testing.expect(cost_pro > 0.006 and cost_pro < 0.007);
+}
+
+test "stripMarkdownFences strips outer fences and preserves indentation" {
+    const fenced = "```zig\n    const x = 1;\n    const y = 2;\n```\n";
+    try std.testing.expectEqualStrings("    const x = 1;\n    const y = 2;", stripMarkdownFences(fenced));
+
+    const plain = "just plain text without fences";
+    try std.testing.expectEqualStrings(plain, stripMarkdownFences(plain));
+
+    const multi = "```zig\nconst a = 1;\n```\nsome text\n```zig\nconst b = 2;\n```";
+    try std.testing.expectEqualStrings(multi, stripMarkdownFences(multi));
 }
 

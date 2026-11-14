@@ -48,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
     const cfg = config_mod.load(allocator, io, init.environ_map);
 
     var model_override: ?[]const u8 = null;
+    var lang_override: ?[]const u8 = null;
     var save_key_val: ?[]const u8 = null;
     var do_clear = false;
     var raw_mode = false;
@@ -94,6 +95,24 @@ pub fn main(init: std.process.Init) !void {
             fallback_mode = false;
         } else if (std.mem.eql(u8, arg, "--fallback")) {
             fallback_mode = true;
+        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--lang")) {
+            if (args_it.next()) |l| {
+                if (l.len > 0) lang_override = l;
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "\n{s}Error:{s} Option '{s}' requires a language argument.\n\n",
+                    .{ ui_mod.Colors.error_color ++ ui_mod.Colors.bold, ui_mod.Colors.reset, arg },
+                );
+                try stdout.writeStreamingAll(io, err_msg);
+                return;
+            }
+        } else if (std.mem.startsWith(u8, arg, "-l=")) {
+            const val = arg["-l=".len..];
+            if (val.len > 0) lang_override = val;
+        } else if (std.mem.startsWith(u8, arg, "--lang=")) {
+            const val = arg["--lang=".len..];
+            if (val.len > 0) lang_override = val;
         } else if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "--set-key")) {
             if (args_it.next()) |k| {
                 save_key_val = k;
@@ -133,6 +152,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout.writeStreamingAll(io, err_msg);
             return;
         } else {
+            end_of_flags = true;
             try prompt_parts.append(allocator, arg);
         }
     }
@@ -248,10 +268,24 @@ pub fn main(init: std.process.Init) !void {
         const user_text = try joined_prompt.toOwnedSlice(allocator);
 
         if (piped_input) |piped| {
+            if (lang_override) |lang| {
+                final_prompt = try std.fmt.allocPrint(
+                    allocator,
+                    "Language / File Type: {s}\nContext / Input:\n```{s}\n{s}\n```\n\nQuestion / Request: {s}",
+                    .{ lang, lang, piped, user_text },
+                );
+            } else {
+                final_prompt = try std.fmt.allocPrint(
+                    allocator,
+                    "Context / Input:\n```\n{s}\n```\n\nQuestion / Request: {s}",
+                    .{ piped, user_text },
+                );
+            }
+        } else if (lang_override) |lang| {
             final_prompt = try std.fmt.allocPrint(
                 allocator,
-                "Context / Input:\n```\n{s}\n```\n\nQuestion / Request: {s}",
-                .{ piped, user_text },
+                "Language / File Type: {s}\nRequest: {s}",
+                .{ lang, user_text },
             );
         } else {
             final_prompt = user_text;
@@ -281,11 +315,17 @@ pub fn main(init: std.process.Init) !void {
     // Single shot query
     const is_stdout_tty = stdout.isTty(io) catch true;
     const should_style = is_stdout_tty and !raw_mode;
+    const use_live_stream = stream_mode and !raw_mode;
+
+    const effective_system_instruction: []const u8 = if (raw_mode)
+        "You are a fast, precise code and text assistant running in raw output mode (e.g. inside an editor buffer or shell pipe). Output ONLY the requested code or direct answer as raw plain text. NEVER wrap output in markdown code blocks (no ``` fences), and do NOT include conversational preamble, greetings, or explanations unless explicitly asked."
+    else
+        cfg.system_instruction;
 
     const t_start = Io.Timestamp.now(io, .awake);
 
     var spinner: ?ui_mod.Spinner = null;
-    if (should_style and !stream_mode) {
+    if (should_style and !use_live_stream) {
         spinner = ui_mod.Spinner.start(allocator, io, stdout, "Thinking...") catch null;
     }
 
@@ -293,7 +333,7 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .stdout = stdout,
         .allocator = allocator,
-        .should_style = should_style and stream_mode,
+        .should_style = should_style and use_live_stream,
     };
     var err_detail: ?api_mod.ApiErrorDetail = null;
 
@@ -304,12 +344,12 @@ pub fn main(init: std.process.Init) !void {
         model_to_use,
         fallback_mode,
         final_prompt.?,
-        cfg.system_instruction,
+        effective_system_instruction,
         cfg.temperature,
         cfg.thinking_budget,
-        if (stream_mode) handleStart else null,
-        if (stream_mode) handleChunk else null,
-        if (stream_mode) @ptrCast(&stream_ctx) else null,
+        if (use_live_stream) handleStart else null,
+        if (use_live_stream) handleChunk else null,
+        if (use_live_stream) @ptrCast(&stream_ctx) else null,
         &err_detail,
     ) catch |err| {
         if (spinner) |*sp| sp.stop(allocator);
@@ -346,7 +386,7 @@ pub fn main(init: std.process.Init) !void {
     const elapsed: u64 = @intCast(@max(0, t_start.durationTo(t_end).toMilliseconds()));
 
     if (should_style) {
-        if (!stream_mode) {
+        if (!use_live_stream) {
             ui_mod.printBanner(io, stdout, allocator, response.model, response.is_fallback);
             ui_mod.renderMarkdown(io, stdout, allocator, response.text);
         } else {
@@ -366,11 +406,16 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     } else {
-        if (!stream_mode) {
-            try stdout.writeStreamingAll(io, response.text);
-        }
-        if (!std.mem.endsWith(u8, response.text, "\n")) {
-            try stdout.writeStreamingAll(io, "\n");
+        if (!use_live_stream) {
+            const out_text = if (raw_mode) ui_mod.stripMarkdownFences(response.text) else response.text;
+            try stdout.writeStreamingAll(io, out_text);
+            if (!std.mem.endsWith(u8, out_text, "\n")) {
+                try stdout.writeStreamingAll(io, "\n");
+            }
+        } else {
+            if (!std.mem.endsWith(u8, response.text, "\n")) {
+                try stdout.writeStreamingAll(io, "\n");
+            }
         }
     }
 }
