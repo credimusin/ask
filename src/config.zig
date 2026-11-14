@@ -31,6 +31,7 @@ pub fn getConfigPath(allocator: std.mem.Allocator, environ: *std.process.Environ
 pub fn load(allocator: std.mem.Allocator, io: Io, environ: *std.process.Environ.Map) Config {
     const default_cfg = Config{};
     const config_path = getConfigPath(allocator, environ) catch return default_cfg;
+    defer allocator.free(config_path);
 
     const file = Dir.openFileAbsolute(io, config_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
@@ -81,4 +82,20 @@ pub fn saveDefault(io: Io, path: []const u8) !void {
         \\
     ;
     try file.writeStreamingAll(io, default_json);
+}
+
+test "getConfigPath uses XDG_CONFIG_HOME or HOME" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("HOME", "/home/testuser");
+    const p1 = try getConfigPath(allocator, &env);
+    defer allocator.free(p1);
+    try std.testing.expectEqualStrings("/home/testuser/.config/ask/config.json", p1);
+
+    try env.put("XDG_CONFIG_HOME", "/custom/config");
+    const p2 = try getConfigPath(allocator, &env);
+    defer allocator.free(p2);
+    try std.testing.expectEqualStrings("/custom/config/ask/config.json", p2);
 }

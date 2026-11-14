@@ -5,15 +5,11 @@ const File = std.Io.File;
 const Dir = std.Io.Dir;
 const config_mod = @import("config.zig");
 
-pub fn getHomeDir(environ: *std.process.Environ.Map) []const u8 {
-    return config_mod.getHomeDir(environ);
-}
-
 pub fn getCredentialsPath(allocator: Allocator, environ: *std.process.Environ.Map) ![]const u8 {
     if (environ.get("XDG_DATA_HOME")) |xdg_data| {
         return try std.fmt.allocPrint(allocator, "{s}/ask/credentials", .{xdg_data});
     }
-    const home = getHomeDir(environ);
+    const home = config_mod.getHomeDir(environ);
     return try std.fmt.allocPrint(allocator, "{s}/.local/share/ask/credentials", .{home});
 }
 
@@ -81,16 +77,36 @@ pub fn saveApiKey(
         Dir.createDirAbsolute(io, dir_path, File.Permissions.fromMode(0o700)) catch {};
     }
 
-    const file = try Dir.createFileAbsolute(io, cred_path, .{});
+    const file = try Dir.createFileAbsolute(io, cred_path, .{
+        .permissions = File.Permissions.fromMode(0o600),
+    });
     defer file.close(io);
 
-    // Set secure file permissions (0600: read/write owner only)
-    file.setPermissions(io, File.Permissions.fromMode(0o600)) catch {};
+    // Enforce secure file permissions (0600: read/write owner only) before writing key
+    try file.setPermissions(io, File.Permissions.fromMode(0o600));
 
     try file.writeStreamingAll(io, trimmed_key);
     try file.writeStreamingAll(io, "\n");
 
     return cred_path;
+}
+
+test "getCredentialsPath and getApiKey from env" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("XDG_DATA_HOME", "/custom/data");
+    const cred_path = try getCredentialsPath(allocator, &env);
+    defer allocator.free(cred_path);
+    try std.testing.expectEqualStrings("/custom/data/ask/credentials", cred_path);
+
+    try env.put("GEMINI_API_KEY", "  test-secret-key-123 \n");
+    const key = getApiKey(allocator, io, &env);
+    try std.testing.expect(key != null);
+    defer allocator.free(key.?);
+    try std.testing.expectEqualStrings("test-secret-key-123", key.?);
 }
 
 pub fn clearAll(

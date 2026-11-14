@@ -4,14 +4,12 @@ const Io = std.Io;
 const File = std.Io.File;
 const http = std.http;
 
-var original_netLookup: *const fn(
+var original_netLookup: *const fn (
     ?*anyopaque,
     Io.net.HostName,
     *Io.Queue(Io.net.HostName.LookupResult),
-    Io.net.HostName.LookupOptions
+    Io.net.HostName.LookupOptions,
 ) Io.net.HostName.LookupError!void = undefined;
-var custom_vtable: Io.VTable = undefined;
-var vtable_initialized: bool = false;
 
 fn forceIp4NetLookup(
     userdata: ?*anyopaque,
@@ -37,10 +35,10 @@ pub const ApiErrorDetail = struct {
     title: []const u8,
     message: []const u8,
     suggestion: ?[]const u8 = null,
+    stream_started: bool = false,
 };
 
 pub const ApiError = error{
-    MissingApiKey,
     NetworkError,
     HttpError,
     ApiErrorResponse,
@@ -248,15 +246,14 @@ pub fn generateContentStream(
 ) !ApiResponse {
     if (error_detail_out) |out| out.* = null;
 
-    if (!vtable_initialized) {
+    if (io.vtable.netLookup != forceIp4NetLookup) {
         original_netLookup = io.vtable.netLookup;
-        custom_vtable = io.vtable.*;
-        custom_vtable.netLookup = forceIp4NetLookup;
-        vtable_initialized = true;
     }
+    var local_vtable = io.vtable.*;
+    local_vtable.netLookup = forceIp4NetLookup;
     const custom_io = Io{
         .userdata = io.userdata,
-        .vtable = &custom_vtable,
+        .vtable = &local_vtable,
     };
 
     var client = http.Client{ .allocator = allocator, .io = custom_io };
@@ -341,8 +338,13 @@ pub fn generateContentStream(
     if (resp.head.status != .ok) {
         var err_reader = resp.reader(&.{});
         var err_buf: [4096]u8 = undefined;
-        const amt = err_reader.readSliceShort(&err_buf) catch 0;
-        const err_slice = err_buf[0..amt];
+        var total_err_read: usize = 0;
+        while (total_err_read < err_buf.len) {
+            const amt = err_reader.readSliceShort(err_buf[total_err_read..]) catch break;
+            if (amt == 0) break;
+            total_err_read += amt;
+        }
+        const err_slice = err_buf[0..total_err_read];
 
         const status_code: u16 = @intFromEnum(resp.head.status);
         var raw_msg: ?[]const u8 = null;
@@ -463,94 +465,103 @@ pub fn generateContentStream(
         return error.HttpError;
     }
 
-    if (on_start) |start_cb| {
-        if (ctx_ptr) |ctx| {
-            start_cb(ctx, model, is_fallback);
-        }
-    }
-
     var r = resp.reader(&.{});
     var total_text: std.ArrayList(u8) = .empty;
     errdefer total_text.deinit(allocator);
 
     var prompt_tokens: ?i64 = null;
     var candidates_tokens: ?i64 = null;
+    var stream_started = false;
 
     var line_buf: std.ArrayList(u8) = .empty;
     defer line_buf.deinit(allocator);
 
     var read_buf: [1024]u8 = undefined;
 
-    while (true) {
-        const amt = r.readSliceShort(&read_buf) catch break;
-        if (amt == 0) break;
+    const processLine = struct {
+        fn handle(
+            s_alloc: Allocator,
+            raw_line: []const u8,
+            s_model: []const u8,
+            s_is_fallback: bool,
+            s_on_start: ?OnStartCallback,
+            s_on_chunk: ?ChunkCallback,
+            s_ctx_ptr: ?*anyopaque,
+            s_started: *bool,
+            s_total_text: *std.ArrayList(u8),
+            s_prompt_tokens: *?i64,
+            s_candidates_tokens: *?i64,
+            s_error_detail_out: ?*?ApiErrorDetail,
+        ) !void {
+            const line = std.mem.trim(u8, raw_line, "\r");
+            if (!std.mem.startsWith(u8, line, "data: ")) return;
 
-        for (read_buf[0..amt]) |byte| {
-            if (byte == '\n') {
-                const line = std.mem.trim(u8, line_buf.items, "\r");
-                if (std.mem.startsWith(u8, line, "data: ")) {
-                    const json_data = line[6..];
-                    var arena = std.heap.ArenaAllocator.init(allocator);
-                    defer arena.deinit();
-                    const arena_alloc = arena.allocator();
+            const json_data = line[6..];
+            var arena = std.heap.ArenaAllocator.init(s_alloc);
+            defer arena.deinit();
+            const arena_alloc = arena.allocator();
 
-                    if (std.json.parseFromSlice(std.json.Value, arena_alloc, json_data, .{})) |parsed| {
-                        if (parsed.value == .object) {
-                            // Check API error in stream
-                            if (parsed.value.object.get("error")) |api_err| {
-                                if (api_err == .object) {
-                                    var stream_err_msg: []const u8 = "An error occurred during streaming.";
-                                    if (api_err.object.get("message")) |msg_val| {
-                                        if (msg_val == .string) {
-                                            stream_err_msg = msg_val.string;
-                                        }
-                                    }
-                                    if (error_detail_out) |out| {
-                                        out.* = ApiErrorDetail{
-                                            .title = "Stream Generation Error",
-                                            .message = try allocator.dupe(u8, stream_err_msg),
-                                            .suggestion = "Retry your request or switch model.",
-                                        };
-                                    }
-                                    return error.ApiErrorResponse;
+            if (std.json.parseFromSlice(std.json.Value, arena_alloc, json_data, .{})) |parsed| {
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("error")) |api_err| {
+                        if (api_err == .object) {
+                            var stream_err_msg: []const u8 = "An error occurred during streaming.";
+                            if (api_err.object.get("message")) |msg_val| {
+                                if (msg_val == .string) {
+                                    stream_err_msg = msg_val.string;
                                 }
                             }
-
-                            // Check usageMetadata
-                            if (parsed.value.object.get("usageMetadata")) |usage| {
-                                if (usage == .object) {
-                                    if (usage.object.get("promptTokenCount")) |pt| {
-                                        if (pt == .integer) prompt_tokens = pt.integer;
-                                    }
-                                    if (usage.object.get("candidatesTokenCount")) |ct| {
-                                        if (ct == .integer) candidates_tokens = ct.integer;
-                                    }
-                                }
+                            if (s_error_detail_out) |out| {
+                                out.* = ApiErrorDetail{
+                                    .title = "Stream Generation Error",
+                                    .message = try s_alloc.dupe(u8, stream_err_msg),
+                                    .suggestion = "Retry your request or switch model.",
+                                    .stream_started = s_started.*,
+                                };
                             }
+                            return error.ApiErrorResponse;
+                        }
+                    }
 
-                            // Extract text chunk (excluding thought scratchpad)
-                            if (parsed.value.object.get("candidates")) |cands| {
-                                if (cands == .array and cands.array.items.len > 0) {
-                                    const first = cands.array.items[0];
-                                    if (first == .object) {
-                                        if (first.object.get("content")) |content| {
-                                            if (content == .object) {
-                                                if (content.object.get("parts")) |parts| {
-                                                    if (parts == .array) {
-                                                        for (parts.array.items) |part| {
-                                                            if (part == .object) {
-                                                                if (part.object.get("thought")) |th| {
-                                                                    if (th == .bool and th.bool) continue;
-                                                                }
+                    if (parsed.value.object.get("usageMetadata")) |usage| {
+                        if (usage == .object) {
+                            if (usage.object.get("promptTokenCount")) |pt| {
+                                if (pt == .integer) s_prompt_tokens.* = pt.integer;
+                            }
+                            if (usage.object.get("candidatesTokenCount")) |ct| {
+                                if (ct == .integer) s_candidates_tokens.* = ct.integer;
+                            }
+                        }
+                    }
 
-                                                                if (part.object.get("text")) |t_val| {
-                                                                    if (t_val == .string and t_val.string.len > 0) {
-                                                                        try total_text.appendSlice(allocator, t_val.string);
-                                                                        if (on_chunk) |cb| {
-                                                                            if (ctx_ptr) |ctx| {
-                                                                                cb(ctx, t_val.string);
-                                                                            }
+                    if (parsed.value.object.get("candidates")) |cands| {
+                        if (cands == .array and cands.array.items.len > 0) {
+                            const first = cands.array.items[0];
+                            if (first == .object) {
+                                if (first.object.get("content")) |content| {
+                                    if (content == .object) {
+                                        if (content.object.get("parts")) |parts| {
+                                            if (parts == .array) {
+                                                for (parts.array.items) |part| {
+                                                    if (part == .object) {
+                                                        if (part.object.get("thought")) |th| {
+                                                            if (th == .bool and th.bool) continue;
+                                                        }
+
+                                                        if (part.object.get("text")) |t_val| {
+                                                            if (t_val == .string and t_val.string.len > 0) {
+                                                                if (!s_started.*) {
+                                                                    if (s_on_start) |start_cb| {
+                                                                        if (s_ctx_ptr) |ctx| {
+                                                                            start_cb(ctx, s_model, s_is_fallback);
                                                                         }
+                                                                    }
+                                                                    s_started.* = true;
+                                                                }
+                                                                try s_total_text.appendSlice(s_alloc, t_val.string);
+                                                                if (s_on_chunk) |cb| {
+                                                                    if (s_ctx_ptr) |ctx| {
+                                                                        cb(ctx, t_val.string);
                                                                     }
                                                                 }
                                                             }
@@ -563,13 +574,54 @@ pub fn generateContentStream(
                                 }
                             }
                         }
-                    } else |_| {}
+                    }
                 }
+            } else |_| {}
+        }
+    }.handle;
+
+    while (true) {
+        const amt = r.readSliceShort(&read_buf) catch break;
+        if (amt == 0) break;
+
+        for (read_buf[0..amt]) |byte| {
+            if (byte == '\n') {
+                try processLine(
+                    allocator,
+                    line_buf.items,
+                    model,
+                    is_fallback,
+                    on_start,
+                    on_chunk,
+                    ctx_ptr,
+                    &stream_started,
+                    &total_text,
+                    &prompt_tokens,
+                    &candidates_tokens,
+                    error_detail_out,
+                );
                 line_buf.clearRetainingCapacity();
             } else {
                 try line_buf.append(allocator, byte);
             }
         }
+    }
+
+    if (line_buf.items.len > 0) {
+        try processLine(
+            allocator,
+            line_buf.items,
+            model,
+            is_fallback,
+            on_start,
+            on_chunk,
+            ctx_ptr,
+            &stream_started,
+            &total_text,
+            &prompt_tokens,
+            &candidates_tokens,
+            error_detail_out,
+        );
     }
 
     if (total_text.items.len == 0) {
@@ -578,6 +630,7 @@ pub fn generateContentStream(
                 .title = "Empty Model Response",
                 .message = "The model did not return any candidates or response text.",
                 .suggestion = "The request may have triggered content safety filters, or prompt was empty.",
+                .stream_started = stream_started,
             };
         }
         return error.NoCandidates;
@@ -656,7 +709,7 @@ pub fn generateWithFallback(
             last_err = err;
             if (error_detail_out) |out| {
                 if (out.*) |detail| {
-                    if (!isFallbackEligibleError(detail.status_code)) {
+                    if (detail.stream_started or !isFallbackEligibleError(detail.status_code)) {
                         return err;
                     }
                 }
@@ -666,4 +719,40 @@ pub fn generateWithFallback(
     }
 
     return last_err;
+}
+
+test "jsonEscape escapes quotes, backslashes, and control characters" {
+    const allocator = std.testing.allocator;
+    const escaped = try jsonEscape(allocator, "hello \"world\"\n\\tab\t\x01");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("hello \\\"world\\\"\\n\\\\tab\\t\\u0001", escaped);
+}
+
+test "modelSupportsThinking and modelSupportsSystemInstruction" {
+    try std.testing.expect(modelSupportsThinking("gemini-2.5-flash"));
+    try std.testing.expect(modelSupportsThinking("gemini-3.5-flash"));
+    try std.testing.expect(!modelSupportsThinking("gemini-3.5-flash-lite"));
+    try std.testing.expect(!modelSupportsThinking("gemma-4-31b-it"));
+
+    try std.testing.expect(modelSupportsSystemInstruction("gemini-3.5-flash-lite"));
+    try std.testing.expect(modelSupportsSystemInstruction("gemma-4-31b-it"));
+    try std.testing.expect(!modelSupportsSystemInstruction("gemma-2-9b-it"));
+}
+
+test "parseRetrySeconds extracts retry delay" {
+    try std.testing.expectEqual(@as(?u64, 15), parseRetrySeconds("Quota exceeded. Please retry in 14.2s."));
+    try std.testing.expectEqual(@as(?u64, null), parseRetrySeconds("Some other error message"));
+}
+
+test "buildPayload constructs valid JSON" {
+    const allocator = std.testing.allocator;
+    const payload = try buildPayload(allocator, "gemini-2.5-flash", "Hi \"there\"", "Be brief", 0.2, 0);
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("contents") != null);
+    try std.testing.expect(parsed.value.object.get("systemInstruction") != null);
+    try std.testing.expect(parsed.value.object.get("generationConfig") != null);
 }

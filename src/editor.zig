@@ -11,31 +11,40 @@ pub const LineResult = union(enum) {
     clear_screen: void,
 };
 
-pub fn visualWidth(str: []const u8) usize {
-    return ui_mod.visualWidth(str);
-}
-
-pub fn getTerminalWidth() usize {
-    var ws: std.posix.winsize = .{
-        .row = 0,
-        .col = 0,
-        .xpixel = 0,
-        .ypixel = 0,
-    };
-    const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (rc == 0 and ws.col > 0) {
-        return ws.col;
-    }
-    return 80;
-}
-
 pub fn visualOffsetToByteIndex(buf: []const u8, target_w: usize) usize {
     var cur_w: usize = 0;
     var i: usize = 0;
     while (i < buf.len) {
         if (cur_w >= target_w) return i;
-        const b = buf[i];
-        if ((b & 0xC0) != 0x80) {
+        if (buf[i] == 0x1B) {
+            i += 1;
+            if (i < buf.len and buf[i] == '[') {
+                i += 1;
+                while (i < buf.len) : (i += 1) {
+                    const c = buf[i];
+                    if (c >= 0x40 and c <= 0x7E) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(buf[i]) catch {
+            cur_w += 1;
+            i += 1;
+            continue;
+        };
+        if (i + seq_len <= buf.len) {
+            if (std.unicode.utf8Decode(buf[i .. i + seq_len])) |cp| {
+                const w = ui_mod.codepointWidth(cp);
+                if (cur_w + w > target_w) return i;
+                cur_w += w;
+                i += seq_len;
+                continue;
+            } else |_| {}
+        }
+        if ((buf[i] & 0xC0) != 0x80) {
             cur_w += 1;
         }
         i += 1;
@@ -69,7 +78,7 @@ fn redrawLine(
     buffer: []const u8,
     cursor_pos: usize,
 ) void {
-    const term_w = getTerminalWidth();
+    const term_w = ui_mod.getTerminalWidth();
     const prompt_w = ui_mod.visualWidth(prompt_colored);
     const total_w = ui_mod.visualWidth(buffer);
     const avail_w = if (term_w > prompt_w + 4) term_w - prompt_w - 3 else 20;
@@ -453,18 +462,28 @@ pub fn readInteractiveLine(
             stdout.writeStreamingAll(io, finalize) catch {};
 
             const trimmed = std.mem.trim(u8, line_buf.items, " \t\r\n");
-            if (trimmed.len > 0) {
-                const duped = allocator.dupe(u8, trimmed) catch return .exit;
-                return .{ .line = duped };
-            } else {
-                return .{ .line = "" };
-            }
+            const duped = allocator.dupe(u8, trimmed) catch return .exit;
+            return .{ .line = duped };
         }
 
-        // 11. Normal character / UTF-8 byte
-        if (b >= 0x20 or (b & 0xC0) == 0x80 or (b & 0xC0) == 0xC0 or (b & 0xE0) == 0xE0 or (b & 0xF0) == 0xF0) {
+        // 11. Normal printable ASCII or multi-byte UTF-8 character
+        if (b >= 0x20 and b != 0x7F) {
             line_buf.insert(allocator, cursor_pos, b) catch continue;
             cursor_pos += 1;
+
+            if (b >= 0x80) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                var rem: usize = 1;
+                while (rem < seq_len) : (rem += 1) {
+                    var cont_b: [1]u8 = undefined;
+                    var cont_iov = [_][]u8{&cont_b};
+                    const r_amt = stdin.readStreaming(io, &cont_iov) catch break;
+                    if (r_amt != 1) break;
+                    line_buf.insert(allocator, cursor_pos, cont_b[0]) catch break;
+                    cursor_pos += 1;
+                }
+            }
+
             redrawLine(io, stdout, allocator, prompt_colored, line_buf.items, cursor_pos);
         }
     }
@@ -481,7 +500,7 @@ test "prevCharIndex and nextCharIndex with ASCII and UTF-8" {
     try std.testing.expectEqual(@as(usize, 12), utf8.len);
     try std.testing.expectEqual(@as(usize, 10), prevCharIndex(utf8, 12));
     try std.testing.expectEqual(@as(usize, 2), nextCharIndex(utf8, 0));
-    try std.testing.expectEqual(@as(usize, 6), visualWidth(utf8));
+    try std.testing.expectEqual(@as(usize, 6), ui_mod.visualWidth(utf8));
 
     try std.testing.expectEqual(@as(usize, 0), visualOffsetToByteIndex(utf8, 0));
     try std.testing.expectEqual(@as(usize, 2), visualOffsetToByteIndex(utf8, 1));

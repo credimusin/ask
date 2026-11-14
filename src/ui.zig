@@ -3,10 +3,11 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const File = std.Io.File;
 
+pub const AVAILABLE_KEYS = "abcdefghijklmnoprstuvwxz"; // 'q' is strictly reserved for quit, 'y' for copy/yank
+
 pub const Colors = struct {
     pub const reset = "\x1b[0m";
     pub const bold = "\x1b[1m";
-    pub const dim = "\x1b[2m";
     pub const italic = "\x1b[3m";
     pub const underline = "\x1b[4m";
 
@@ -21,11 +22,10 @@ pub const Colors = struct {
     pub const text = "\x1b[38;2;202;211;245m"; // Text #cad3f5
     pub const text_dim = "\x1b[38;2;110;115;141m"; // Gray #6e738d
     pub const border = "\x1b[38;2;73;77;100m"; // Surface #494d64
-    pub const border_bright = "\x1b[38;2;91;96;120m"; // Surface1 #5b6078
     pub const code_line = "\x1b[38;2;184;192;224m"; // Subtext0 #b8c0e0
 };
 
-pub fn getBoxWidth() usize {
+pub fn getTerminalWidth() usize {
     var ws: std.posix.winsize = .{
         .row = 0,
         .col = 0,
@@ -34,12 +34,40 @@ pub fn getBoxWidth() usize {
     };
     const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
     if (rc == 0 and ws.col > 0) {
-        const c: usize = ws.col;
-        if (c < 48) return 44;
-        if (c > 110) return 100;
-        return c - 4;
+        return ws.col;
     }
-    return 68;
+    return 80;
+}
+
+pub fn getBoxWidth() usize {
+    const c = getTerminalWidth();
+    if (c < 48) return 44;
+    if (c > 110) return 100;
+    return c - 4;
+}
+
+pub fn codepointWidth(cp: u21) usize {
+    if (cp < 0x20 or (cp >= 0x7F and cp < 0xA0)) return 0;
+    // Combining marks, zero-width space/joiners, variation selectors
+    if ((cp >= 0x0300 and cp <= 0x036F) or
+        (cp >= 0x200B and cp <= 0x200F) or
+        (cp >= 0xFE00 and cp <= 0xFE0F))
+    {
+        return 0;
+    }
+    // Wide CJK, fullwidth forms, and Emoji blocks
+    if ((cp >= 0x1100 and cp <= 0x115F) or
+        (cp >= 0x2E80 and cp <= 0xA4CF) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE10 and cp <= 0xFE6F) or
+        (cp >= 0xFF00 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x1F300 and cp <= 0x1FAFF))
+    {
+        return 2;
+    }
+    return 1;
 }
 
 pub fn visualWidth(str: []const u8) usize {
@@ -70,8 +98,19 @@ pub fn visualWidth(str: []const u8) usize {
             continue;
         }
 
-        const b = str[i];
-        if ((b & 0xC0) != 0x80) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(str[i]) catch {
+            i += 1;
+            width += 1;
+            continue;
+        };
+        if (i + seq_len <= str.len) {
+            if (std.unicode.utf8Decode(str[i .. i + seq_len])) |cp| {
+                width += codepointWidth(cp);
+                i += seq_len;
+                continue;
+            } else |_| {}
+        }
+        if ((str[i] & 0xC0) != 0x80) {
             width += 1;
         }
         i += 1;
@@ -168,15 +207,22 @@ fn writeDashes(allocator: Allocator, count: usize) ![]const u8 {
 pub const Spinner = struct {
     running: *std.atomic.Value(bool),
     thread: ?std.Thread,
+    io: Io,
+    stdout: File,
 
-    pub fn start(allocator: Allocator, msg: []const u8) !Spinner {
+    pub fn start(allocator: Allocator, io: Io, stdout: File, msg: []const u8) !Spinner {
         const running_ptr = try allocator.create(std.atomic.Value(bool));
         running_ptr.* = std.atomic.Value(bool).init(true);
 
-        const thread = try std.Thread.spawn(.{}, runSpinner, .{ running_ptr, msg });
+        const thread = std.Thread.spawn(.{}, runSpinner, .{ running_ptr, io, stdout, msg }) catch |err| {
+            allocator.destroy(running_ptr);
+            return err;
+        };
         return Spinner{
             .running = running_ptr,
             .thread = thread,
+            .io = io,
+            .stdout = stdout,
         };
     }
 
@@ -187,7 +233,7 @@ pub const Spinner = struct {
             self.thread = null;
         }
         allocator.destroy(self.running);
-        std.debug.print("\r\x1b[2K", .{});
+        self.stdout.writeStreamingAll(self.io, "\r\x1b[2K") catch {};
     }
 };
 
@@ -198,27 +244,30 @@ pub fn sleepMs(ms: u64) void {
     _ = std.os.linux.nanosleep(&ts, null);
 }
 
-fn runSpinner(running: *std.atomic.Value(bool), msg: []const u8) void {
+fn runSpinner(running: *std.atomic.Value(bool), io: Io, stdout: File, msg: []const u8) void {
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     var i: usize = 0;
+    var frame_buf: [256]u8 = undefined;
     while (running.load(.acquire)) {
-        std.debug.print("\r\x1b[2K  {s}{s}{s} {s}{s}{s}", .{
+        if (std.fmt.bufPrint(&frame_buf, "\r\x1b[2K  {s}{s}{s} {s}{s}{s}", .{
             Colors.secondary ++ Colors.bold,
             frames[i % frames.len],
             Colors.reset,
             Colors.code_line,
             msg,
             Colors.reset,
-        });
+        })) |line| {
+            stdout.writeStreamingAll(io, line) catch {};
+        } else |_| {}
         i += 1;
         sleepMs(80);
     }
-    std.debug.print("\r\x1b[2K", .{});
+    stdout.writeStreamingAll(io, "\r\x1b[2K") catch {};
 }
 
 pub fn printBanner(io: Io, stdout: File, allocator: Allocator, model: []const u8, is_fallback: bool) void {
     const short_model = formatModelShort(allocator, model, is_fallback) catch model;
-    defer if (!std.mem.eql(u8, short_model, model)) allocator.free(short_model);
+    defer if (short_model.ptr != model.ptr) allocator.free(short_model);
 
     const box_w = getBoxWidth();
     // "╭── " (4) + "✦ Ask (" (7) + visualWidth(short_model) + ") " (2)
@@ -271,7 +320,7 @@ pub fn printTuiResponseHeader(io: Io, stdout: File, allocator: Allocator, model:
     const box_w = getBoxWidth();
     if (is_fallback) {
         const short_model = formatModelShort(allocator, model, true) catch model;
-        defer if (!std.mem.eql(u8, short_model, model)) allocator.free(short_model);
+        defer if (short_model.ptr != model.ptr) allocator.free(short_model);
 
         const prefix_len = 4 + 2 + visualWidth(short_model) + 1; // "╭── ✦ " (6) + name + " " (1)
         const dashes_count = if (box_w > prefix_len) box_w - prefix_len else 4;
@@ -386,6 +435,10 @@ pub fn printFooter(
 }
 
 pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
+    return formatInlineWithStyle(allocator, input, Colors.text);
+}
+
+pub fn formatInlineWithStyle(allocator: Allocator, input: []const u8, base_style: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -399,7 +452,8 @@ pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
                 const code_content = rest[0..close_idx];
                 out.appendSlice(allocator, Colors.highlight ++ Colors.bold) catch break;
                 out.appendSlice(allocator, code_content) catch break;
-                out.appendSlice(allocator, Colors.reset ++ Colors.text) catch break;
+                out.appendSlice(allocator, Colors.reset) catch break;
+                out.appendSlice(allocator, base_style) catch break;
                 i = i + 1 + close_idx + 1;
                 continue;
             }
@@ -411,11 +465,13 @@ pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
             const rest = input[i + 2 ..];
             if (std.mem.indexOf(u8, rest, delim)) |close_idx| {
                 const bold_content = rest[0..close_idx];
-                out.appendSlice(allocator, Colors.bold ++ Colors.flamingo) catch break;
-                const formatted_inner = formatInline(allocator, bold_content);
-                defer allocator.free(formatted_inner);
+                const bold_style = Colors.bold ++ Colors.flamingo;
+                out.appendSlice(allocator, bold_style) catch break;
+                const formatted_inner = formatInlineWithStyle(allocator, bold_content, bold_style);
+                defer if (formatted_inner.ptr != bold_content.ptr) allocator.free(formatted_inner);
                 out.appendSlice(allocator, formatted_inner) catch break;
-                out.appendSlice(allocator, Colors.reset ++ Colors.text) catch break;
+                out.appendSlice(allocator, Colors.reset) catch break;
+                out.appendSlice(allocator, base_style) catch break;
                 i = i + 2 + close_idx + 2;
                 continue;
             }
@@ -436,7 +492,8 @@ pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
                         out.appendSlice(allocator, link_text) catch break;
                         out.appendSlice(allocator, Colors.reset ++ Colors.text_dim ++ " (") catch break;
                         out.appendSlice(allocator, link_url) catch break;
-                        out.appendSlice(allocator, ")" ++ Colors.reset ++ Colors.text) catch break;
+                        out.appendSlice(allocator, ")" ++ Colors.reset) catch break;
+                        out.appendSlice(allocator, base_style) catch break;
 
                         i = i + 1 + close_bracket + 1 + 1 + close_paren + 1;
                         continue;
@@ -445,17 +502,25 @@ pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
             }
         }
 
-        // 4. Italic text: *italic* or _italic_
+        // 4. Italic text: *italic* or _italic_ (respecting word boundaries for '_')
         if ((input[i] == '*' or input[i] == '_') and (i + 1 < input.len and input[i + 1] != ' ')) {
             const delim = input[i];
-            const rest = input[i + 1 ..];
-            if (std.mem.indexOfScalar(u8, rest, delim)) |close_idx| {
-                const italic_content = rest[0..close_idx];
-                out.appendSlice(allocator, Colors.italic ++ Colors.secondary) catch break;
-                out.appendSlice(allocator, italic_content) catch break;
-                out.appendSlice(allocator, Colors.reset ++ Colors.text) catch break;
-                i = i + 1 + close_idx + 1;
-                continue;
+            const prev_is_alnum = if (i > 0) std.ascii.isAlphanumeric(input[i - 1]) else false;
+            if (delim != '_' or !prev_is_alnum) {
+                const rest = input[i + 1 ..];
+                if (std.mem.indexOfScalar(u8, rest, delim)) |close_idx| {
+                    const after_close_idx = i + 1 + close_idx + 1;
+                    const next_is_alnum = if (after_close_idx < input.len) std.ascii.isAlphanumeric(input[after_close_idx]) else false;
+                    if (close_idx > 0 and rest[close_idx - 1] != ' ' and (delim != '_' or !next_is_alnum)) {
+                        const italic_content = rest[0..close_idx];
+                        out.appendSlice(allocator, Colors.italic ++ Colors.secondary) catch break;
+                        out.appendSlice(allocator, italic_content) catch break;
+                        out.appendSlice(allocator, Colors.reset) catch break;
+                        out.appendSlice(allocator, base_style) catch break;
+                        i = after_close_idx;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -466,7 +531,8 @@ pub fn formatInline(allocator: Allocator, input: []const u8) []const u8 {
                 const strike_content = rest[0..close_idx];
                 out.appendSlice(allocator, "\x1b[9m" ++ Colors.text_dim) catch break;
                 out.appendSlice(allocator, strike_content) catch break;
-                out.appendSlice(allocator, Colors.reset ++ Colors.text) catch break;
+                out.appendSlice(allocator, Colors.reset) catch break;
+                out.appendSlice(allocator, base_style) catch break;
                 i = i + 2 + close_idx + 2;
                 continue;
             }
@@ -491,7 +557,7 @@ pub fn printWrappedText(
     max_line_width: usize,
 ) void {
     const formatted = formatInline(allocator, raw_text);
-    defer if (!std.mem.eql(u8, formatted, raw_text)) allocator.free(formatted);
+    defer if (formatted.ptr != raw_text.ptr) allocator.free(formatted);
 
     var words: std.ArrayList([]const u8) = .empty;
     defer words.deinit(allocator);
@@ -601,7 +667,6 @@ pub fn printWrappedText(
 }
 
 pub fn renderMarkdown(io: Io, stdout: File, allocator: Allocator, text: []const u8) void {
-    const AVAILABLE_KEYS = "abcdefghijklmnoprstuvwxz";
     var lines = std.mem.splitScalar(u8, text, '\n');
     var in_code_block = false;
     var block_idx: usize = 0;
@@ -618,54 +683,85 @@ pub fn renderMarkdown(io: Io, stdout: File, allocator: Allocator, text: []const 
                 in_code_block = true;
                 last_was_empty = false;
                 const lang = std.mem.trim(u8, trimmed_line[3..], " \t`");
-                const key_char = if (block_idx < AVAILABLE_KEYS.len) AVAILABLE_KEYS[block_idx] else 'a';
+                const key_char: ?u8 = if (block_idx < AVAILABLE_KEYS.len) AVAILABLE_KEYS[block_idx] else null;
                 block_idx += 1;
 
                 if (lang.len > 0) {
-                    const prefix_len = 6 + 6 + visualWidth(lang) + 1;
+                    const key_part_w: usize = if (key_char != null) 6 else 0;
+                    const prefix_len = 6 + key_part_w + visualWidth(lang) + 1;
                     const dashes_count = if (box_w > prefix_len) box_w - prefix_len else 4;
                     const dashes = writeDashes(allocator, dashes_count) catch continue;
                     defer allocator.free(dashes);
 
-                    const h = std.fmt.allocPrint(
-                        allocator,
-                        "  {s}╭──{s} {s}[ {c} ]{s} {s}{s}{s} {s}{s}{s}\n",
-                        .{
-                            Colors.border,
-                            Colors.reset,
-                            Colors.primary ++ Colors.bold,
-                            key_char,
-                            Colors.reset,
-                            Colors.warn ++ Colors.bold,
-                            lang,
-                            Colors.reset,
-                            Colors.border,
-                            dashes,
-                            Colors.reset,
-                        },
-                    ) catch continue;
+                    const h = if (key_char) |kc|
+                        std.fmt.allocPrint(
+                            allocator,
+                            "  {s}╭──{s} {s}[ {c} ]{s} {s}{s}{s} {s}{s}{s}\n",
+                            .{
+                                Colors.border,
+                                Colors.reset,
+                                Colors.primary ++ Colors.bold,
+                                kc,
+                                Colors.reset,
+                                Colors.warn ++ Colors.bold,
+                                lang,
+                                Colors.reset,
+                                Colors.border,
+                                dashes,
+                                Colors.reset,
+                            },
+                        ) catch continue
+                    else
+                        std.fmt.allocPrint(
+                            allocator,
+                            "  {s}╭──{s} {s}{s}{s} {s}{s}{s}\n",
+                            .{
+                                Colors.border,
+                                Colors.reset,
+                                Colors.warn ++ Colors.bold,
+                                lang,
+                                Colors.reset,
+                                Colors.border,
+                                dashes,
+                                Colors.reset,
+                            },
+                        ) catch continue;
                     defer allocator.free(h);
                     stdout.writeStreamingAll(io, h) catch {};
                 } else {
-                    const prefix_len = 6 + 6;
+                    const key_part_w: usize = if (key_char != null) 6 else 0;
+                    const prefix_len = 6 + key_part_w;
                     const dashes_count = if (box_w > prefix_len) box_w - prefix_len else 4;
                     const dashes = writeDashes(allocator, dashes_count) catch continue;
                     defer allocator.free(dashes);
 
-                    const h = std.fmt.allocPrint(
-                        allocator,
-                        "  {s}╭──{s} {s}[ {c} ]{s} {s}{s}{s}\n",
-                        .{
-                            Colors.border,
-                            Colors.reset,
-                            Colors.primary ++ Colors.bold,
-                            key_char,
-                            Colors.reset,
-                            Colors.border,
-                            dashes,
-                            Colors.reset,
-                        },
-                    ) catch continue;
+                    const h = if (key_char) |kc|
+                        std.fmt.allocPrint(
+                            allocator,
+                            "  {s}╭──{s} {s}[ {c} ]{s} {s}{s}{s}\n",
+                            .{
+                                Colors.border,
+                                Colors.reset,
+                                Colors.primary ++ Colors.bold,
+                                kc,
+                                Colors.reset,
+                                Colors.border,
+                                dashes,
+                                Colors.reset,
+                            },
+                        ) catch continue
+                    else
+                        std.fmt.allocPrint(
+                            allocator,
+                            "  {s}╭──{s} {s}{s}{s}\n",
+                            .{
+                                Colors.border,
+                                Colors.reset,
+                                Colors.border,
+                                dashes,
+                                Colors.reset,
+                            },
+                        ) catch continue;
                     defer allocator.free(h);
                     stdout.writeStreamingAll(io, h) catch {};
                 }
@@ -853,7 +949,7 @@ pub fn renderMarkdown(io: Io, stdout: File, allocator: Allocator, text: []const 
                 continue;
             } else {
                 const formatted = formatInline(allocator, trimmed_line);
-                defer allocator.free(formatted);
+                defer if (formatted.ptr != trimmed_line.ptr) allocator.free(formatted);
                 const row = std.fmt.allocPrint(
                     allocator,
                     "  {s}{s}{s}\n",
@@ -1177,7 +1273,7 @@ pub fn printTuiWelcome(io: Io, stdout: File, allocator: Allocator, model: []cons
     const S = Colors.secondary ++ Colors.bold;
 
     const short_model = formatModelShort(allocator, model, false) catch model;
-    defer if (!std.mem.eql(u8, short_model, model)) allocator.free(short_model);
+    defer if (short_model.ptr != model.ptr) allocator.free(short_model);
 
     const box_w = getBoxWidth();
     // "╭── " (4) + "✦ Ask (" (7) + visualWidth(short_model) + ") " (2)
@@ -1362,6 +1458,8 @@ pub fn printTuiToast(io: Io, stdout: File, allocator: Allocator, msg: []const u8
 
 pub fn printSnippetHint(io: Io, stdout: File, allocator: Allocator, count: usize) void {
     if (count == 0) return;
+    const last_idx = @min(count, AVAILABLE_KEYS.len) - 1;
+    const last_key = AVAILABLE_KEYS[last_idx];
     const msg = if (count == 1)
         std.fmt.allocPrint(
             allocator,
@@ -1372,7 +1470,7 @@ pub fn printSnippetHint(io: Io, stdout: File, allocator: Allocator, count: usize
         std.fmt.allocPrint(
             allocator,
             "  {s}💡 Snippets [a..{c}]: {s}/copy a{s}, {s}/run a{s}, or {s}/copy{s} for all text{s}\n\n",
-            .{ Colors.text_dim, @as(u8, @intCast('a' + count - 1)), Colors.warn, Colors.text_dim, Colors.primary, Colors.text_dim, Colors.highlight, Colors.text_dim, Colors.reset },
+            .{ Colors.text_dim, last_key, Colors.warn, Colors.text_dim, Colors.primary, Colors.text_dim, Colors.highlight, Colors.text_dim, Colors.reset },
         ) catch return;
     defer allocator.free(msg);
     stdout.writeStreamingAll(io, msg) catch {};
@@ -1465,6 +1563,23 @@ test "visualWidth tests" {
     // ANSI escape sequences
     const styled = "\x1b[1m\x1b[38;2;138;173;244mTest\x1b[0m";
     try std.testing.expectEqual(@as(usize, 4), visualWidth(styled));
+
+    // Wide emoji
+    try std.testing.expectEqual(@as(usize, 2), visualWidth("💡"));
+}
+
+test "formatInline preserves snake_case and nested styles without leaks" {
+    const allocator = std.testing.allocator;
+
+    const plain = "some_snake_case_identifier and normal text";
+    const f_plain = formatInline(allocator, plain);
+    defer if (f_plain.ptr != plain.ptr) allocator.free(f_plain);
+    try std.testing.expectEqualStrings(plain, f_plain);
+
+    const nested = "**bold with `code` inside**";
+    const f_nested = formatInline(allocator, nested);
+    defer if (f_nested.ptr != nested.ptr) allocator.free(f_nested);
+    try std.testing.expect(std.mem.indexOf(u8, f_nested, Colors.bold ++ Colors.flamingo ++ " inside") != null);
 }
 
 test "calculateCostUsd tests" {

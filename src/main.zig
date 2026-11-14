@@ -63,7 +63,17 @@ pub fn main(init: std.process.Init) !void {
     var args_it = init.minimal.args.iterate();
     _ = args_it.next(); // Skip executable path
 
+    var end_of_flags = false;
+
     while (args_it.next()) |arg| {
+        if (end_of_flags) {
+            try prompt_parts.append(allocator, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            end_of_flags = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             show_help = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
@@ -87,6 +97,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "--set-key")) {
             if (args_it.next()) |k| {
                 save_key_val = k;
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "\n{s}Error:{s} Option '{s}' requires an API key argument.\n\n",
+                    .{ ui_mod.Colors.error_color ++ ui_mod.Colors.bold, ui_mod.Colors.reset, arg },
+                );
+                try stdout.writeStreamingAll(io, err_msg);
+                return;
             }
         } else if (std.mem.startsWith(u8, arg, "--key=")) {
             save_key_val = arg["--key=".len..];
@@ -95,9 +113,25 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
             if (args_it.next()) |m| {
                 model_override = m;
+            } else {
+                const err_msg = try std.fmt.allocPrint(
+                    allocator,
+                    "\n{s}Error:{s} Option '{s}' requires a model name argument.\n\n",
+                    .{ ui_mod.Colors.error_color ++ ui_mod.Colors.bold, ui_mod.Colors.reset, arg },
+                );
+                try stdout.writeStreamingAll(io, err_msg);
+                return;
             }
         } else if (std.mem.startsWith(u8, arg, "--model=")) {
             model_override = arg["--model=".len..];
+        } else if (arg.len > 1 and arg[0] == '-') {
+            const err_msg = try std.fmt.allocPrint(
+                allocator,
+                "\n{s}Error:{s} Unknown option '{s}'. Run {s}ask --help{s} for usage.\n\n",
+                .{ ui_mod.Colors.error_color ++ ui_mod.Colors.bold, ui_mod.Colors.reset, arg, ui_mod.Colors.warn, ui_mod.Colors.reset },
+            );
+            try stdout.writeStreamingAll(io, err_msg);
+            return;
         } else {
             try prompt_parts.append(allocator, arg);
         }
@@ -142,7 +176,15 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(cfg_path);
         const cred_path = try auth_mod.getCredentialsPath(allocator, init.environ_map);
         defer allocator.free(cred_path);
-        const has_key = auth_mod.getApiKey(allocator, io, init.environ_map) != null;
+        const maybe_key = auth_mod.getApiKey(allocator, io, init.environ_map);
+        defer if (maybe_key) |k| allocator.free(k);
+        const has_key = maybe_key != null;
+
+        const budget_str = if (cfg.thinking_budget) |b|
+            try std.fmt.allocPrint(allocator, "{d}", .{b})
+        else
+            "default";
+        defer if (cfg.thinking_budget != null) allocator.free(budget_str);
 
         const c_str = try std.fmt.allocPrint(
             allocator,
@@ -165,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
                 if (stream_mode) "enabled" else "disabled",
                 if (cfg.stream) "enabled" else "disabled",
                 cfg.temperature,
-                if (cfg.thinking_budget) |b| try std.fmt.allocPrint(allocator, "{d}", .{b}) else "default",
+                budget_str,
                 cfg.theme,
             },
         );
@@ -227,7 +269,7 @@ pub fn main(init: std.process.Init) !void {
 
     // If no arguments (or --tui) and stdin is a TTY, run interactive TUI
     if ((final_prompt == null or force_tui) and is_stdin_tty) {
-        try runInteractive(allocator, io, stdout, stdin, init.environ_map, api_key.?, model_to_use, cfg.system_instruction, cfg.temperature, cfg.thinking_budget, stream_mode, fallback_mode);
+        try runInteractive(init.gpa, io, stdout, stdin, init.environ_map, api_key.?, model_to_use, cfg.system_instruction, cfg.temperature, cfg.thinking_budget, stream_mode, fallback_mode);
         return;
     }
 
@@ -244,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
 
     var spinner: ?ui_mod.Spinner = null;
     if (should_style and !stream_mode) {
-        spinner = ui_mod.Spinner.start(allocator, "Thinking...") catch null;
+        spinner = ui_mod.Spinner.start(allocator, io, stdout, "Thinking...") catch null;
     }
 
     var stream_ctx = StreamCtx{
@@ -317,7 +359,11 @@ pub fn main(init: std.process.Init) !void {
 
         const snippets = runner_mod.extractCodeSnippets(allocator, response.text);
         if (snippets.len > 0) {
-            runner_mod.promptAndExecute(allocator, io, stdout, stdin, init.environ_map, snippets);
+            if (runner_mod.promptAndExecute(allocator, io, stdout, stdin, init.environ_map, snippets)) |exit_code| {
+                if (exit_code != 0) {
+                    std.process.exit(exit_code);
+                }
+            }
         }
     } else {
         if (!stream_mode) {
@@ -344,6 +390,9 @@ fn runInteractive(
     fallback_mode: bool,
 ) !void {
     var active_model: []const u8 = initial_model;
+    var owned_model: ?[]u8 = null;
+    defer if (owned_model) |m| allocator.free(m);
+
     var stream_mode: bool = initial_stream_mode;
     const temperature: f64 = initial_temperature;
 
@@ -357,13 +406,7 @@ fn runInteractive(
     defer if (last_response_text) |t| allocator.free(t);
 
     var last_snippets: []const runner_mod.CodeSnippet = &[_]runner_mod.CodeSnippet{};
-    defer {
-        for (last_snippets) |s| {
-            allocator.free(s.code);
-            allocator.free(s.lang);
-        }
-        if (last_snippets.len > 0) allocator.free(last_snippets);
-    }
+    defer runner_mod.freeSnippets(allocator, last_snippets);
 
     ui_mod.printTuiWelcome(io, stdout, allocator, active_model, stream_mode);
 
@@ -384,13 +427,16 @@ fn runInteractive(
                 continue;
             },
             .line => |line_raw| {
+                defer allocator.free(line_raw);
                 const line = std.mem.trim(u8, line_raw, " \t\r\n");
                 if (line.len == 0) continue;
 
                 // Add to history if not duplicate of last item
                 if (history.items.len == 0 or !std.mem.eql(u8, history.items[history.items.len - 1], line)) {
                     if (allocator.dupe(u8, line)) |duped| {
-                        history.append(allocator, duped) catch {};
+                        history.append(allocator, duped) catch {
+                            allocator.free(duped);
+                        };
                     } else |_| {}
                 }
 
@@ -429,7 +475,10 @@ fn runInteractive(
                     if (raw_target.len == 0) {
                         ui_mod.printModelList(io, stdout, allocator, active_model);
                     } else {
-                        active_model = try allocator.dupe(u8, raw_target);
+                        const new_model = try allocator.dupe(u8, raw_target);
+                        if (owned_model) |old_m| allocator.free(old_m);
+                        owned_model = new_model;
+                        active_model = new_model;
                         const toast = try std.fmt.allocPrint(allocator, "✦ Active model switched to: {s}", .{active_model});
                         defer allocator.free(toast);
                         ui_mod.printTuiToast(io, stdout, allocator, toast);
@@ -462,21 +511,7 @@ fn runInteractive(
                     const space_idx = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
                     const key_arg = std.mem.trim(u8, line[space_idx + 1 ..], " \t");
                     if (key_arg.len > 0 and last_snippets.len > 0) {
-                        const key_char = key_arg[0];
-                        var found_snip: ?*const runner_mod.CodeSnippet = null;
-                        for (last_snippets) |*s| {
-                            if (s.key == key_char or (std.ascii.toLower(key_char) == s.key)) {
-                                found_snip = s;
-                                break;
-                            }
-                        }
-                        if (found_snip == null and std.ascii.isDigit(key_char) and key_char >= '1') {
-                            const idx: usize = key_char - '1';
-                            if (idx < last_snippets.len) {
-                                found_snip = &last_snippets[idx];
-                            }
-                        }
-                        if (found_snip) |snip| {
+                        if (runner_mod.findSnippet(last_snippets, key_arg[0])) |snip| {
                             runner_mod.copyToClipboard(io, stdout, allocator, snip.code);
                             const toast = try std.fmt.allocPrint(allocator, "✓ Copied snippet [{c}] to clipboard!", .{snip.key});
                             defer allocator.free(toast);
@@ -494,23 +529,15 @@ fn runInteractive(
                     const space_idx = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
                     const key_arg = std.mem.trim(u8, line[space_idx + 1 ..], " \t");
                     if (key_arg.len > 0 and last_snippets.len > 0) {
-                        const key_char = key_arg[0];
-                        var found_snip: ?*const runner_mod.CodeSnippet = null;
-                        for (last_snippets) |*s| {
-                            if (s.key == key_char or (std.ascii.toLower(key_char) == s.key)) {
-                                found_snip = s;
-                                break;
-                            }
-                        }
-                        if (found_snip == null and std.ascii.isDigit(key_char) and key_char >= '1') {
-                            const idx: usize = key_char - '1';
-                            if (idx < last_snippets.len) {
-                                found_snip = &last_snippets[idx];
-                            }
-                        }
-                        if (found_snip) |snip| {
+                        if (runner_mod.findSnippet(last_snippets, key_arg[0])) |snip| {
                             const single_arr = [_]runner_mod.CodeSnippet{snip.*};
-                            runner_mod.promptAndExecute(allocator, io, stdout, stdin, environ_map, &single_arr);
+                            if (runner_mod.promptAndExecute(allocator, io, stdout, stdin, environ_map, &single_arr)) |exit_code| {
+                                if (exit_code != 0) {
+                                    const toast = try std.fmt.allocPrint(allocator, "⚠ Command exited with status {d}", .{exit_code});
+                                    defer allocator.free(toast);
+                                    ui_mod.printTuiToast(io, stdout, allocator, toast);
+                                }
+                            }
                         } else {
                             ui_mod.printTuiToast(io, stdout, allocator, "⚠ Snippet key not found.");
                         }
@@ -529,7 +556,7 @@ fn runInteractive(
 
                 var spinner: ?ui_mod.Spinner = null;
                 if (!stream_mode) {
-                    spinner = ui_mod.Spinner.start(turn_alloc, "Thinking...") catch null;
+                    spinner = ui_mod.Spinner.start(turn_alloc, io, stdout, "Thinking...") catch null;
                 }
 
                 var stream_ctx = StreamCtx{
@@ -586,11 +613,7 @@ fn runInteractive(
                 if (last_response_text) |old| allocator.free(old);
                 last_response_text = allocator.dupe(u8, response.text) catch null;
 
-                for (last_snippets) |s| {
-                    allocator.free(s.code);
-                    allocator.free(s.lang);
-                }
-                if (last_snippets.len > 0) allocator.free(last_snippets);
+                runner_mod.freeSnippets(allocator, last_snippets);
                 last_snippets = runner_mod.extractCodeSnippets(allocator, response.text);
 
                 if (last_snippets.len > 0) {
@@ -599,4 +622,13 @@ fn runInteractive(
             },
         }
     }
+}
+
+test {
+    _ = config_mod;
+    _ = auth_mod;
+    _ = api_mod;
+    _ = ui_mod;
+    _ = runner_mod;
+    _ = editor_mod;
 }

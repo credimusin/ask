@@ -4,9 +4,10 @@ const Io = std.Io;
 const File = std.Io.File;
 const Dir = std.Io.Dir;
 const ui_mod = @import("ui.zig");
+const editor_mod = @import("editor.zig");
 const Colors = ui_mod.Colors;
 
-pub const AVAILABLE_KEYS = "abcdefghijklmnoprstuvwxz"; // 'q' is strictly reserved for quit, 'y' for copy/yank
+pub const AVAILABLE_KEYS = ui_mod.AVAILABLE_KEYS;
 
 pub const CodeSnippet = struct {
     key: u8,
@@ -14,6 +15,14 @@ pub const CodeSnippet = struct {
     code: []const u8,
     is_multiline: bool,
 };
+
+pub fn freeSnippets(allocator: Allocator, snippets: []const CodeSnippet) void {
+    for (snippets) |s| {
+        allocator.free(s.code);
+        allocator.free(s.lang);
+    }
+    if (snippets.len > 0) allocator.free(snippets);
+}
 
 pub const ScriptConfig = struct {
     interpreter: []const u8,
@@ -84,18 +93,25 @@ pub fn extractCodeSnippets(allocator: Allocator, text: []const u8) []const CodeS
             } else {
                 in_code_block = false;
                 const trimmed_code = std.mem.trim(u8, current_code.items, " \t\r\n");
-                if (trimmed_code.len > 0) {
-                    const key_char = if (block_idx < AVAILABLE_KEYS.len) AVAILABLE_KEYS[block_idx] else 'a';
+                if (trimmed_code.len > 0 and block_idx < AVAILABLE_KEYS.len) {
+                    const key_char = AVAILABLE_KEYS[block_idx];
                     const is_multi = std.mem.indexOfScalar(u8, trimmed_code, '\n') != null;
                     const code_copy = allocator.dupe(u8, trimmed_code) catch continue;
-                    const lang_copy = allocator.dupe(u8, current_lang) catch "";
+                    const lang_copy = allocator.dupe(u8, current_lang) catch {
+                        allocator.free(code_copy);
+                        continue;
+                    };
 
                     snippets.append(allocator, .{
                         .key = key_char,
                         .lang = lang_copy,
                         .code = code_copy,
                         .is_multiline = is_multi,
-                    }) catch continue;
+                    }) catch {
+                        allocator.free(code_copy);
+                        allocator.free(lang_copy);
+                        continue;
+                    };
                     block_idx += 1;
                 }
             }
@@ -112,24 +128,35 @@ pub fn extractCodeSnippets(allocator: Allocator, text: []const u8) []const CodeS
 
     if (in_code_block) {
         const trimmed_code = std.mem.trim(u8, current_code.items, " \t\r\n");
-        if (trimmed_code.len > 0) {
-            const key_char = if (block_idx < AVAILABLE_KEYS.len) AVAILABLE_KEYS[block_idx] else 'a';
+        if (trimmed_code.len > 0 and block_idx < AVAILABLE_KEYS.len) {
+            const key_char = AVAILABLE_KEYS[block_idx];
             const is_multi = std.mem.indexOfScalar(u8, trimmed_code, '\n') != null;
-            const code_copy = allocator.dupe(u8, trimmed_code) catch null;
-            const lang_copy = allocator.dupe(u8, current_lang) catch "";
-
-            if (code_copy) |cc| {
-                snippets.append(allocator, .{
-                    .key = key_char,
-                    .lang = lang_copy,
-                    .code = cc,
-                    .is_multiline = is_multi,
-                }) catch {};
-            }
+            if (allocator.dupe(u8, trimmed_code)) |code_copy| {
+                if (allocator.dupe(u8, current_lang)) |lang_copy| {
+                    snippets.append(allocator, .{
+                        .key = key_char,
+                        .lang = lang_copy,
+                        .code = code_copy,
+                        .is_multiline = is_multi,
+                    }) catch {
+                        allocator.free(code_copy);
+                        allocator.free(lang_copy);
+                    };
+                } else |_| {
+                    allocator.free(code_copy);
+                }
+            } else |_| {}
         }
     }
 
-    return snippets.toOwnedSlice(allocator) catch &[_]CodeSnippet{};
+    return snippets.toOwnedSlice(allocator) catch blk: {
+        for (snippets.items) |s| {
+            allocator.free(s.code);
+            allocator.free(s.lang);
+        }
+        snippets.deinit(allocator);
+        break :blk &[_]CodeSnippet{};
+    };
 }
 
 pub fn copyToClipboard(io: Io, stdout: File, allocator: Allocator, text: []const u8) void {
@@ -143,20 +170,20 @@ pub fn copyToClipboard(io: Io, stdout: File, allocator: Allocator, text: []const
     defer allocator.free(osc52);
     stdout.writeStreamingAll(io, osc52) catch {};
 
-    // 2. Also try wl-copy or xclip in the background
+    // 2. Native Wayland clipboard via wl-copy stdin pipe
     var wl_child = std.process.spawn(io, .{
-        .argv = &.{ "wl-copy", text },
-    }) catch null;
-    if (wl_child) |*c| {
-        _ = c.wait(io) catch {};
-    } else {
-        var xclip_child = std.process.spawn(io, .{
-            .argv = &.{ "xclip", "-selection", "clipboard" },
-        }) catch null;
-        if (xclip_child) |*c| {
-            _ = c.wait(io) catch {};
-        }
+        .argv = &.{"wl-copy"},
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+
+    if (wl_child.stdin) |pipe_in| {
+        pipe_in.writeStreamingAll(io, text) catch {};
+        pipe_in.close(io);
+        wl_child.stdin = null;
     }
+    _ = wl_child.wait(io) catch {};
 }
 
 pub const PreparedCommand = struct {
@@ -168,21 +195,28 @@ pub fn prepareSnippetCommand(
     allocator: Allocator,
     io: Io,
     snippet: CodeSnippet,
+    environ_map: ?*std.process.Environ.Map,
 ) !PreparedCommand {
     const pid = std.os.linux.getpid();
     const is_lang = isNonShellLanguage(snippet.lang);
 
     if (snippet.is_multiline or is_lang) {
         const cfg = getScriptConfig(snippet.lang);
+        const runtime_dir = if (environ_map) |env| (env.get("XDG_RUNTIME_DIR") orelse "/tmp") else "/tmp";
+        const ts: u64 = @intCast(@max(0, Io.Timestamp.now(io, .awake).toNanoseconds()));
         const temp_path = try std.fmt.allocPrint(
             allocator,
-            "/tmp/ask_run_{c}_{d}{s}",
-            .{ snippet.key, pid, cfg.ext },
+            "{s}/ask_run_{c}_{d}_{x}{s}",
+            .{ runtime_dir, snippet.key, pid, ts & 0xFFFF_FFFF, cfg.ext },
         );
+        errdefer allocator.free(temp_path);
 
-        const file = try Dir.createFileAbsolute(io, temp_path, .{});
+        const file = try Dir.createFileAbsolute(io, temp_path, .{
+            .permissions = File.Permissions.fromMode(0o700),
+        });
+        errdefer Dir.deleteFileAbsolute(io, temp_path) catch {};
         defer file.close(io);
-        file.setPermissions(io, File.Permissions.fromMode(0o700)) catch {};
+        try file.setPermissions(io, File.Permissions.fromMode(0o700));
         try file.writeStreamingAll(io, snippet.code);
         try file.writeStreamingAll(io, "\n");
 
@@ -204,9 +238,17 @@ pub fn prepareSnippetCommand(
     }
 }
 
-fn findSnippetByKey(snippets: []const CodeSnippet, key: u8) ?*const CodeSnippet {
+pub fn findSnippet(snippets: []const CodeSnippet, key_char: u8) ?*const CodeSnippet {
     for (snippets) |*s| {
-        if (s.key == key) return s;
+        if (s.key == key_char or std.ascii.toLower(key_char) == s.key) {
+            return s;
+        }
+    }
+    if (std.ascii.isDigit(key_char) and key_char >= '1') {
+        const idx: usize = key_char - '1';
+        if (idx < snippets.len) {
+            return &snippets[idx];
+        }
     }
     return null;
 }
@@ -218,7 +260,7 @@ pub fn promptAndExecute(
     stdin: File,
     environ_map: *std.process.Environ.Map,
     snippets: []const CodeSnippet,
-) void {
+) ?u8 {
     var tty_in: ?File = null;
     defer if (tty_in) |tf| tf.close(io);
 
@@ -231,7 +273,7 @@ pub fn promptAndExecute(
             tty_in = f;
             break :blk f;
         }
-        return;
+        return null;
     };
 
     // Terminal raw mode
@@ -262,6 +304,7 @@ pub fn promptAndExecute(
     defer {
         if (active_temp_file) |tf| {
             Dir.deleteFileAbsolute(io, tf) catch {};
+            allocator.free(tf);
         }
     }
 
@@ -281,17 +324,14 @@ pub fn promptAndExecute(
             const R = Colors.reset;
 
             if (buf.len == 0) {
-                var keys_buf: [32]u8 = undefined;
-                var pos: usize = 0;
+                var keys_list: std.ArrayList(u8) = .empty;
+                defer keys_list.deinit(s_allocator);
                 for (snips, 0..) |s, idx| {
                     if (idx > 0) {
-                        keys_buf[pos] = '/';
-                        pos += 1;
+                        keys_list.append(s_allocator, '/') catch return;
                     }
-                    keys_buf[pos] = s.key;
-                    pos += 1;
+                    keys_list.append(s_allocator, s.key) catch return;
                 }
-                const keys_slice = keys_buf[0..pos];
 
                 const msg = std.fmt.allocPrint(
                     s_allocator,
@@ -299,7 +339,7 @@ pub fn promptAndExecute(
                     .{
                         D,
                         Colors.primary ++ Colors.bold,
-                        keys_slice,
+                        keys_list.items,
                         D,
                         Colors.highlight ++ Colors.bold,
                         D,
@@ -332,22 +372,52 @@ pub fn promptAndExecute(
         if (amt == 0) break;
         const b = char_buf[0];
 
-        // 1. Ctrl+C, Ctrl+D, Escape
-        if (b == 0x03 or b == 0x04 or b == 0x1B) {
+        // 1. Escape or escape sequence (arrow keys, etc.)
+        if (b == 0x1B) {
+            var seq_len: usize = 1;
+            while (seq_len < 6) {
+                var next_b: [1]u8 = undefined;
+                var next_iov = [_][]u8{&next_b};
+                var pfd = [_]std.posix.pollfd{.{
+                    .fd = input_fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const poll_res = std.posix.poll(&pfd, 30) catch 0;
+                if (poll_res > 0 and (pfd[0].revents & std.posix.POLL.IN) != 0) {
+                    const read_amt = input_file.readStreaming(io, &next_iov) catch 0;
+                    if (read_amt == 1) {
+                        seq_len += 1;
+                        const last = next_b[0];
+                        if ((last >= 'A' and last <= 'Z') or (last >= 'a' and last <= 'z') or last == '~') {
+                            break;
+                        }
+                    } else break;
+                } else break;
+            }
+            if (seq_len == 1) {
+                stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
+                return null;
+            }
+            continue;
+        }
+
+        // 1b. Ctrl+C, Ctrl+D
+        if (b == 0x03 or b == 0x04) {
             stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
-            return;
+            return null;
         }
 
         // 2. 'q' / 'Q' quit when buffer is empty
         if ((b == 'q' or b == 'Q') and line_buf.items.len == 0) {
             stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
-            return;
+            return null;
         }
 
         // 3. 'y' / 'Y' copy when buffer is empty -> copy and exit immediately
         if ((b == 'y' or b == 'Y') and line_buf.items.len == 0) {
             const target_snip = if (selected_snippet_key) |sk|
-                findSnippetByKey(snippets, sk) orelse &snippets[0]
+                findSnippet(snippets, sk) orelse &snippets[0]
             else
                 &snippets[0];
 
@@ -358,22 +428,23 @@ pub fn promptAndExecute(
                     allocator,
                     "\r\x1b[2K{s}✓ Copied [{c}] to clipboard!{s}\n",
                     .{ Colors.success ++ Colors.bold, target_snip.key, Colors.reset },
-                ) catch return
+                ) catch return null
             else
                 std.fmt.allocPrint(
                     allocator,
                     "\r\x1b[2K{s}✓ Copied to clipboard!{s}\n",
                     .{ Colors.success ++ Colors.bold, Colors.reset },
-                ) catch return;
+                ) catch return null;
             defer allocator.free(copy_msg);
             stdout.writeStreamingAll(io, copy_msg) catch {};
-            return;
+            return null;
         }
 
-        // 4. Backspace / Delete
+        // 4. Backspace / Delete (UTF-8 aware)
         if (b == 0x7F or b == 0x08) {
             if (line_buf.items.len > 0) {
-                _ = line_buf.pop();
+                const prev_pos = editor_mod.prevCharIndex(line_buf.items, line_buf.items.len);
+                line_buf.items.len = prev_pos;
                 renderPrompt(io, stdout, allocator, line_buf.items, snippets);
             }
             continue;
@@ -383,13 +454,18 @@ pub fn promptAndExecute(
         if (b == '\r' or b == '\n') {
             if (line_buf.items.len == 0) {
                 if (snippets.len == 1) {
-                    const prep = prepareSnippetCommand(allocator, io, snippets[0]) catch break;
+                    const prep = prepareSnippetCommand(allocator, io, snippets[0], environ_map) catch break;
+                    defer allocator.free(prep.display_cmd);
+                    if (active_temp_file) |tf| {
+                        Dir.deleteFileAbsolute(io, tf) catch {};
+                        allocator.free(tf);
+                    }
                     active_temp_file = prep.temp_file;
                     line_buf.clearRetainingCapacity();
                     line_buf.appendSlice(allocator, prep.display_cmd) catch break;
                 } else {
                     stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
-                    return;
+                    return null;
                 }
             }
             break;
@@ -397,30 +473,16 @@ pub fn promptAndExecute(
 
         // 7. Check if char matches snippet key (letters 'a'..'z' or digits '1'..'9')
         if (line_buf.items.len == 0) {
-            var matched_snip: ?*const CodeSnippet = null;
-
-            for (snippets) |*s| {
-                if (s.key == b or (std.ascii.toLower(b) == s.key)) {
-                    matched_snip = s;
-                    break;
-                }
-            }
-
-            if (matched_snip == null and std.ascii.isDigit(b) and b >= '1') {
-                const idx: usize = b - '1';
-                if (idx < snippets.len) {
-                    matched_snip = &snippets[idx];
-                }
-            }
-
-            if (matched_snip) |snip| {
+            if (findSnippet(snippets, b)) |snip| {
                 selected_snippet_key = snip.key;
                 if (active_temp_file) |tf| {
                     Dir.deleteFileAbsolute(io, tf) catch {};
+                    allocator.free(tf);
                     active_temp_file = null;
                 }
 
-                const prep = prepareSnippetCommand(allocator, io, snip.*) catch continue;
+                const prep = prepareSnippetCommand(allocator, io, snip.*, environ_map) catch continue;
+                defer allocator.free(prep.display_cmd);
                 active_temp_file = prep.temp_file;
                 line_buf.clearRetainingCapacity();
                 line_buf.appendSlice(allocator, prep.display_cmd) catch continue;
@@ -430,22 +492,33 @@ pub fn promptAndExecute(
             }
         }
 
-        // 8. Normal character typing (editing / manual command)
-        if (b >= 0x20 and b < 0x7F) {
+        // 8. Normal character typing (editing / manual command, UTF-8 aware)
+        if (b >= 0x20 and b != 0x7F) {
             line_buf.append(allocator, b) catch continue;
+            if (b >= 0x80) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                var rem: usize = 1;
+                while (rem < seq_len) : (rem += 1) {
+                    var cont_b: [1]u8 = undefined;
+                    var cont_iov = [_][]u8{&cont_b};
+                    const r_amt = input_file.readStreaming(io, &cont_iov) catch break;
+                    if (r_amt != 1) break;
+                    line_buf.append(allocator, cont_b[0]) catch break;
+                }
+            }
             renderPrompt(io, stdout, allocator, line_buf.items, snippets);
         }
     }
 
     if (line_buf.items.len == 0) {
         stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
-        return;
+        return null;
     }
 
     const command_to_run = std.mem.trim(u8, line_buf.items, " \t\r\n");
     if (command_to_run.len == 0) {
         stdout.writeStreamingAll(io, "\r\x1b[2K\n") catch {};
-        return;
+        return null;
     }
 
     // Restore terminal settings before execution
@@ -457,7 +530,7 @@ pub fn promptAndExecute(
         allocator,
         "\r\x1b[2K{s}Run{s} {s}❯{s} {s}{s}{s}\n\n",
         .{ Colors.primary ++ Colors.bold, Colors.reset, Colors.secondary ++ Colors.bold, Colors.reset, Colors.code_line, command_to_run, Colors.reset },
-    ) catch return;
+    ) catch return null;
     defer allocator.free(finalize_line);
     stdout.writeStreamingAll(io, finalize_line) catch {};
 
@@ -469,27 +542,24 @@ pub fn promptAndExecute(
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch |err| {
-        const err_msg = std.fmt.allocPrint(allocator, "{s}Error running command: {}{s}\n", .{ Colors.error_color, err, Colors.reset }) catch return;
+        const err_msg = std.fmt.allocPrint(allocator, "{s}Error running command: {}{s}\n", .{ Colors.error_color, err, Colors.reset }) catch return 1;
         defer allocator.free(err_msg);
         stdout.writeStreamingAll(io, err_msg) catch {};
-        return;
+        return 1;
     };
 
-    const term = child.wait(io) catch return;
+    const term = child.wait(io) catch return 1;
 
     if (active_temp_file) |tf| {
         Dir.deleteFileAbsolute(io, tf) catch {};
+        allocator.free(tf);
         active_temp_file = null;
     }
 
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.process.exit(code);
-            }
-        },
-        else => std.process.exit(1),
-    }
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
 }
 
 test "AVAILABLE_KEYS does not contain q or y" {
@@ -530,13 +600,7 @@ test "extractCodeSnippets extraction" {
     ;
 
     const snippets = extractCodeSnippets(allocator, text);
-    defer {
-        for (snippets) |s| {
-            allocator.free(s.code);
-            allocator.free(s.lang);
-        }
-        allocator.free(snippets);
-    }
+    defer freeSnippets(allocator, snippets);
 
     try std.testing.expectEqual(@as(usize, 2), snippets.len);
 
@@ -548,6 +612,11 @@ test "extractCodeSnippets extraction" {
     try std.testing.expectEqual('b', snippets[1].key);
     try std.testing.expectEqualStrings("python", snippets[1].lang);
     try std.testing.expect(snippets[1].is_multiline);
+
+    try std.testing.expect(findSnippet(snippets, 'a') != null);
+    try std.testing.expect(findSnippet(snippets, 'B') != null);
+    try std.testing.expectEqual('b', findSnippet(snippets, '2').?.key);
+    try std.testing.expect(findSnippet(snippets, 'z') == null);
 }
 
 test "prepareSnippetCommand single line vs multiline" {
@@ -561,7 +630,7 @@ test "prepareSnippetCommand single line vs multiline" {
         .is_multiline = false,
     };
 
-    const prep_single = try prepareSnippetCommand(allocator, io, single_snippet);
+    const prep_single = try prepareSnippetCommand(allocator, io, single_snippet, null);
     defer allocator.free(prep_single.display_cmd);
     try std.testing.expectEqualStrings("git status", prep_single.display_cmd);
     try std.testing.expect(prep_single.temp_file == null);
@@ -573,7 +642,7 @@ test "prepareSnippetCommand single line vs multiline" {
         .is_multiline = true,
     };
 
-    const prep_multi = try prepareSnippetCommand(allocator, io, multi_snippet);
+    const prep_multi = try prepareSnippetCommand(allocator, io, multi_snippet, null);
     defer {
         allocator.free(prep_multi.display_cmd);
         if (prep_multi.temp_file) |tf| {
