@@ -22,6 +22,66 @@ fn forceIp4NetLookup(
     return original_netLookup(userdata, host_name, resolved, new_options);
 }
 
+// Manual IPv4 connection (ensures we only connect via IPv4 across Linux, macOS, and Windows)
+fn connectIpv4(
+    io: Io,
+    client: *http.Client,
+    host_str: []const u8,
+    port: u16,
+) !*http.Client.Connection {
+    const host_domain = Io.net.HostName.init(host_str) catch return error.NetworkError;
+
+    var lookup_buf: [16]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buf);
+    host_domain.lookup(io, &lookup_queue, .{
+        .port = port,
+        .family = .ip4,
+    }) catch return error.NetworkError;
+
+    var ip4_addr: ?Io.net.Ip4Address = null;
+    while (lookup_queue.getOne(io)) |dns_res| {
+        switch (dns_res) {
+            .address => |addr| switch (addr) {
+                .ip4 => |ip4| {
+                    if (ip4_addr == null) ip4_addr = ip4;
+                },
+                .ip6 => {},
+            },
+            .canonical_name => {},
+        }
+    } else |_| {}
+
+    const resolved_ip4 = ip4_addr orelse return error.NetworkError;
+    var ip_buf: [32]u8 = undefined;
+    const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+        resolved_ip4.bytes[0],
+        resolved_ip4.bytes[1],
+        resolved_ip4.bytes[2],
+        resolved_ip4.bytes[3],
+    }) catch return error.NetworkError;
+
+    if (client.now == null) {
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, now) catch return error.NetworkError;
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+
+    const host_ip = Io.net.HostName.init(ip_str) catch return error.NetworkError;
+
+    return client.connectTcpOptions(.{
+        .host = host_ip,
+        .port = port,
+        .protocol = .tls,
+        .proxied_host = host_domain,
+        .proxied_port = port,
+    }) catch return error.NetworkError;
+}
+
 pub const ApiResponse = struct {
     text: []const u8,
     model: []const u8,
@@ -292,7 +352,11 @@ pub fn generateContentStream(
         .{ .name = "Content-Type", .value = "application/json" },
     };
 
+    // Use manual IPv4 connection to bypass potential IPv6 issues
+    const maybe_conn = connectIpv4(custom_io, &client, uri.host.?.percent_encoded, uri.port orelse 443) catch null;
+
     var req = client.request(.POST, uri, .{
+        .connection = maybe_conn,
         .extra_headers = &extra_headers,
     }) catch {
         if (error_detail_out) |out| {

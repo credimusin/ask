@@ -36,6 +36,12 @@ pub fn load(allocator: std.mem.Allocator, io: Io, environ: *std.process.Environ.
     const file = Dir.openFileAbsolute(io, config_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             saveDefault(io, config_path) catch {};
+        } else {
+            const stderr = File.stderr();
+            if (std.fmt.allocPrint(allocator, "Warning: Could not read config file: {s}\n", .{@errorName(err)})) |warn| {
+                _ = stderr.writeStreamingAll(io, warn) catch {};
+                allocator.free(warn);
+            } else |_| {}
         }
         return default_cfg;
     };
@@ -57,7 +63,14 @@ pub fn load(allocator: std.mem.Allocator, io: Io, environ: *std.process.Environ.
     const parsed = std.json.parseFromSlice(Config, allocator, list.items, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }) catch return default_cfg;
+    }) catch |err| {
+        const stderr = File.stderr();
+        if (std.fmt.allocPrint(allocator, "Warning: Invalid config file, using defaults: {s}\n", .{@errorName(err)})) |warn| {
+            _ = stderr.writeStreamingAll(io, warn) catch {};
+            allocator.free(warn);
+        } else |_| {}
+        return default_cfg;
+    };
 
     return parsed.value;
 }
