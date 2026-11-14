@@ -8,7 +8,7 @@ Designed for developers and terminal power users who want instant answers, expla
 
 ## Features
 
-- **Cloud & Local LLM (`-L` / `--local`)**: Uses Google Gemini API (`Gemini 3.5 / 2.5 / Gemma 4`) by default, or connects to any local `llama-server` / OpenAI-compatible endpoint (`--local`) for 100% offline use.
+- **Cloud & Local LLM**: Uses Google Gemini API (`Gemini 3.5 / 2.5 / Gemma 4`) by default, or connects to any local `llama-server` / OpenAI-compatible endpoint (`--local`) for 100% offline use.
 - **One-Shot CLI & Interactive TUI**: Run quick unquoted queries from the shell (`ask how to...`) or launch a floating TUI session (`ask` / `--tui`) with history and slash commands (`/local`, `/model`, `/copy`, `/run`).
 - **Interactive Snippet Runner**: Code blocks get hotkeys (`[ a ]`, `[ b ]`) — press `a` to edit/run commands directly in your shell or `y` to copy to clipboard (`OSC 52` / `wl-copy`).
 - **Editor & Pipe Ready (`-r`, `-l`)**: Pipe `stdin` (`git diff | ask ...`) or integrate directly with editors like **Helix** using `-r` (strips UI and ` ``` ` fences) and `-l=<lang>`.
@@ -238,3 +238,5 @@ bindsym --to-code $mod+Mod1+i exec ~/.local/bin/ask-popup.sh
 - **Credentials File:** `$XDG_DATA_HOME/ask/credentials` (defaults to `~/.local/share/ask/credentials`, permission `-rw-------`)
 - **Environment Variables Supported:** `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`.
 
+---
+By the way, Google didn’t pay me for this, but they did provide some indirect help for sure.

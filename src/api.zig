@@ -716,6 +716,8 @@ pub fn generateWithFallback(
     api_key: []const u8,
     primary_model: []const u8,
     fallback_enabled: bool,
+    local_url: []const u8,
+    local_model: []const u8,
     prompt: []const u8,
     system_instruction: ?[]const u8,
     temperature: f64,
@@ -774,13 +776,40 @@ pub fn generateWithFallback(
             last_err = err;
             if (error_detail_out) |out| {
                 if (out.*) |detail| {
-                    if (detail.stream_started or !isFallbackEligibleError(detail.status_code)) {
+                    if (detail.stream_started) {
                         return err;
+                    }
+                    if (!isFallbackEligibleError(detail.status_code)) {
+                        break;
                     }
                 }
             }
+            // If network/TLS connection to Google API host failed, other Gemini models use the same host
+            if (err == error.NetworkError) {
+                break;
+            }
             continue;
         }
+    }
+
+    if (fallback_enabled) {
+        if (generateLocalStream(
+            allocator,
+            io,
+            local_url,
+            local_model,
+            prompt,
+            system_instruction,
+            temperature,
+            true,
+            on_start,
+            on_chunk,
+            ctx_ptr,
+            null,
+        )) |local_resp| {
+            if (error_detail_out) |out| out.* = null;
+            return local_resp;
+        } else |_| {}
     }
 
     return last_err;
@@ -869,6 +898,7 @@ pub fn generateLocalStream(
     prompt: []const u8,
     system_instruction: ?[]const u8,
     temperature: f64,
+    is_fallback: bool,
     on_start: ?OnStartCallback,
     on_chunk: ?ChunkCallback,
     ctx_ptr: ?*anyopaque,
@@ -1031,6 +1061,7 @@ pub fn generateLocalStream(
             s_alloc: Allocator,
             raw_line: []const u8,
             s_model: []const u8,
+            s_is_fallback: bool,
             s_on_start: ?OnStartCallback,
             s_on_chunk: ?ChunkCallback,
             s_ctx_ptr: ?*anyopaque,
@@ -1133,7 +1164,7 @@ pub fn generateLocalStream(
                                     if (!s_started.*) {
                                         if (s_on_start) |start_cb| {
                                             if (s_ctx_ptr) |ctx| {
-                                                start_cb(ctx, s_model, false);
+                                                start_cb(ctx, s_model, s_is_fallback);
                                             }
                                         }
                                         s_started.* = true;
@@ -1163,6 +1194,7 @@ pub fn generateLocalStream(
                     allocator,
                     line_buf.items,
                     model,
+                    is_fallback,
                     on_start,
                     on_chunk,
                     ctx_ptr,
@@ -1184,6 +1216,7 @@ pub fn generateLocalStream(
             allocator,
             line_buf.items,
             model,
+            is_fallback,
             on_start,
             on_chunk,
             ctx_ptr,
@@ -1212,7 +1245,7 @@ pub fn generateLocalStream(
         .model = try allocator.dupe(u8, model),
         .prompt_tokens = prompt_tokens,
         .candidates_tokens = candidates_tokens,
-        .is_fallback = false,
+        .is_fallback = is_fallback,
     };
 }
 

@@ -235,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
             \\Cloud Model:     {s}
             \\Local Model:     {s}
             \\Local URL:       {s}
-            \\Fallback:        {s} (pool: gemini-3.5-flash, gemini-3.5-flash-lite, gemini-2.5-flash, gemini-2.5-flash-lite, gemma-4-31b-it)
+            \\Fallback:        {s} (pool: gemini-3.5-flash, gemini-3.5-flash-lite, gemini-2.5-flash, gemini-2.5-flash-lite, gemma-4-31b-it -> local LLM)
             \\Streaming:       {s} (default in config: {s})
             \\Temp:            {d:.2}
             \\Thinking Budget: {s}
@@ -392,6 +392,7 @@ pub fn main(init: std.process.Init) !void {
             final_prompt.?,
             effective_system_instruction,
             cfg.temperature,
+            false,
             if (use_live_stream) handleStart else null,
             if (use_live_stream) handleChunk else null,
             if (use_live_stream) @ptrCast(&stream_ctx) else null,
@@ -404,6 +405,8 @@ pub fn main(init: std.process.Init) !void {
             api_key.?,
             model_to_use,
             fallback_mode,
+            local_url_to_use,
+            cfg.local_model,
             final_prompt.?,
             effective_system_instruction,
             cfg.temperature,
@@ -711,6 +714,7 @@ fn runInteractive(
                         line,
                         system_instruction,
                         temperature,
+                        false,
                         if (stream_mode) handleStart else null,
                         if (stream_mode) handleChunk else null,
                         if (stream_mode) @ptrCast(&stream_ctx) else null,
@@ -723,6 +727,8 @@ fn runInteractive(
                         api_key.?,
                         active_model,
                         fallback_mode,
+                        local_url,
+                        default_local_model,
                         line,
                         system_instruction,
                         temperature,
